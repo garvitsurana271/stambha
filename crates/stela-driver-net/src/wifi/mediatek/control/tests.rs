@@ -638,3 +638,28 @@ fn unchanged_pinned_prefetch_and_enable_match_except_explicit_polling_irq_policy
         );
     }
 }
+
+#[test]
+fn an_unused_ring_with_only_a_size_is_cleared_and_one_with_state_is_refused() {
+    // MT7925 TX ring 1 keeps size 512 across the resets, with no base and
+    // nothing pending (Lenovo IdeaPad Pro 5 16AKP10).
+    let mut m = Model::default();
+    m.registers.insert(tx_ring(1) + 4, 512);
+    let mut c = setup(Chip::Mt7925, m);
+    c.driver_own(false).unwrap();
+    c.verify_unused_queues().unwrap();
+    assert_eq!(c.registers.test_io().registers[&(tx_ring(1) + 4)], 0);
+
+    for (offset, value) in [(0, 0x1000), (8, 3)] {
+        let mut m = Model::default();
+        m.registers.insert(tx_ring(1) + 4, 512);
+        m.registers.insert(tx_ring(1) + offset, value);
+        let mut c = setup(Chip::Mt7925, m);
+        c.driver_own(false).unwrap();
+        assert!(matches!(
+            c.verify_unused_queues(),
+            Err(Error::DormantQueue { address, size: 512, .. }) if address == tx_ring(1)
+        ));
+        assert_eq!(c.registers.test_io().registers[&(tx_ring(1) + 4)], 512);
+    }
+}

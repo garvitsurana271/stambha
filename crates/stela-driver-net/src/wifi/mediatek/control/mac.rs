@@ -221,6 +221,40 @@ impl<I: BarIo> Control<I> {
     /// Reject stale dormant queue counts before enabling this exact ordinary
     /// source layout. No speculative queue is installed and no live foreign
     /// queue is silently reset. Fresh namespace ownership is required.
+    /// An unused ring whose size alone is set, with no base and nothing
+    /// pending (CPU index equal to DMA index), holds no descriptor the engine
+    /// could fetch: its size is cleared and read back. The MT7925 of a Lenovo
+    /// IdeaPad Pro 5 16AKP10 keeps TX ring 1's size at 512 across the WFSYS
+    /// and WFDMA resets. Any other unused ring with state is refused.
+    fn clear_dormant_queue(&mut self, ring: u32) -> Result<(), Error> {
+        let size = self.read_control(ring + 4)?;
+        if size == 0 {
+            return Ok(());
+        }
+        let base = self.read_control(ring)?;
+        let cpu = self.read_control(ring + 8)?;
+        let dma = self.read_control(ring + 12)?;
+        if base != 0 || cpu != dma {
+            return Err(Error::DormantQueue {
+                address: ring,
+                base,
+                size,
+                cpu,
+                dma,
+            });
+        }
+        self.registers.write32(ring + 4, 0)?;
+        let actual = self.read_control(ring + 4)?;
+        if actual != 0 {
+            return Err(Error::Readback {
+                address: ring + 4,
+                mask: u32::MAX,
+                expected: 0,
+                actual,
+            });
+        }
+        Ok(())
+    }
     pub(in crate::wifi::mediatek) fn verify_unused_queues(&mut self) -> Result<(), Error> {
         self.guard(true)?;
         let result = (|| {
@@ -229,31 +263,13 @@ impl<I: BarIo> Control<I> {
                 if qid == 0 || qid == 16 || qid == if c3 { 15 } else { 17 } {
                     continue;
                 }
-                let address = tx_ring(qid) + 4;
-                let actual = self.read_control(address)?;
-                if actual != 0 {
-                    return Err(Error::Readback {
-                        address,
-                        mask: u32::MAX,
-                        expected: 0,
-                        actual,
-                    });
-                }
+                self.clear_dormant_queue(tx_ring(qid))?;
             }
             for qid in 0..=5 {
                 if qid == 0 || qid == 2 || (!c3 && qid == 4) {
                     continue;
                 }
-                let address = rx_ring(qid) + 4;
-                let actual = self.read_control(address)?;
-                if actual != 0 {
-                    return Err(Error::Readback {
-                        address,
-                        mask: u32::MAX,
-                        expected: 0,
-                        actual,
-                    });
-                }
+                self.clear_dormant_queue(rx_ring(qid))?;
             }
             Ok(())
         })();

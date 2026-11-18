@@ -64,6 +64,15 @@ pub enum Error {
         actual: u32,
     },
     Register(registers::Error),
+    /// An unused ring with a descriptor base or pending descriptors: a
+    /// queue that may be live, which is never reset.
+    DormantQueue {
+        address: u32,
+        base: u32,
+        size: u32,
+        cpu: u32,
+        dma: u32,
+    },
     Unavailable {
         address: u32,
     },

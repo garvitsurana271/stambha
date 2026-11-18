@@ -651,12 +651,15 @@ fn dormant_foreign_queue_is_refused_before_any_dma_publication() {
         return;
     }
     let mut f = NativeFixture::new(Chip::Mt7925);
+    // A size with a descriptor base: a queue that may be live. A size alone
+    // is cleared (`control::tests`).
     f.bar.0.lock().unwrap().values.insert(0xd4514, 17);
+    f.bar.0.lock().unwrap().values.insert(0xd4510, 0x1000);
     assert!(matches!(
         f.install(),
         Err(BootError::Control(
-            crate::wifi::mediatek::control::Error::Readback {
-                address: 0xd4514,
+            crate::wifi::mediatek::control::Error::DormantQueue {
+                address: 0xd4510,
                 ..
             }
         ))

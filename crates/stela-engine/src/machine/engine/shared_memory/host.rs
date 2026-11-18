@@ -5,6 +5,7 @@ pub use completion::HeldRamService;
 
 use super::super::publication;
 use super::*;
+use crate::machine::engine::{HostClock, NativeView, OUTSIDE_KINDS};
 use crate::machine::{InstallError, NativeCode, NativeExit, Regime, mmu};
 use publication::{
     HostEffect, HostEffectCommand, HostEffectReceipt, WithPayload, WorkerId, WorkerServices,
@@ -381,6 +382,15 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
     fn pan_in_flags(&self) -> bool {
         self.local.pan_in_flags()
     }
+    fn native_view(&mut self, from: &Regime, to: &Regime) -> Option<NativeView> {
+        // Native code runs on this BSP's local host alone (`execute`), whose
+        // regime `set_regime` keeps outside a source service.
+        if self.source_service() {
+            None
+        } else {
+            self.local.native_view(from, to)
+        }
+    }
     fn code_invalidated(&mut self, page: Option<u64>) {
         if self.source_service() {
             self.effect(HostEffect::CodeInvalidated(page));
@@ -412,6 +422,15 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
     }
     fn tsc_counter(&self) -> Option<(u64, u64)> {
         self.local.tsc_counter()
+    }
+    fn native_ticks(&self) -> u64 {
+        self.local.native_ticks()
+    }
+    fn outside(&self) -> [[u64; 2]; OUTSIDE_KINDS] {
+        self.local.outside()
+    }
+    fn clock(&self) -> HostClock {
+        self.local.clock()
     }
     fn profile_ticks(&mut self) -> u64 {
         self.local.profile_ticks()
@@ -532,6 +551,18 @@ pub(in crate::machine::engine::shared_memory) mod tests {
         fn profile_ticks(&mut self) -> u64 {
             7
         }
+        fn native_ticks(&self) -> u64 {
+            11
+        }
+        fn outside(&self) -> [[u64; 2]; OUTSIDE_KINDS] {
+            [[3, 5]; OUTSIDE_KINDS]
+        }
+        fn clock(&self) -> HostClock {
+            HostClock {
+                samples: 13,
+                ..HostClock::default()
+            }
+        }
         fn arm_timer(&mut self, _: Option<u64>) {}
         fn wait_for_interrupt(&mut self) {
             unreachable!()
@@ -543,6 +574,17 @@ pub(in crate::machine::engine::shared_memory) mod tests {
         let (.., ram) = super::super::policy::tests::fixture();
         let mut host = ServiceHost::new(Local, OneWorker(None), ram);
         assert_eq!(host.profile_ticks(), 7);
+    }
+
+    /// The heartbeat's guest share, exit split and clock of the PE the
+    /// wrapper runs are the local core's, not the trait's zeros.
+    #[test]
+    fn the_wrapper_keeps_the_local_time_counts() {
+        let (.., ram) = super::super::policy::tests::fixture();
+        let host = ServiceHost::new(Local, OneWorker(None), ram);
+        assert_eq!(host.native_ticks(), 11);
+        assert_eq!(host.outside(), [[3, 5]; OUTSIDE_KINDS]);
+        assert_eq!(host.clock().samples, 13);
     }
     pub(in crate::machine::engine::shared_memory) struct OneWorker(
         pub(in crate::machine::engine::shared_memory) Option<WorkerOwner>,

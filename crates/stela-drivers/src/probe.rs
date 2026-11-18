@@ -1384,6 +1384,8 @@ impl Devices {
         self.audio.extend(found.audio);
         self.bluetooth_bootloaders.extend(found.bootloaders);
         for mut device in found.bluetooth {
+            // Named, so its firmware load is not the last device's time.
+            crate::working("USB Bluetooth firmware");
             // The kept result owns its evidence/errors;
             // no catalog borrow or firmware bytes escape.
             let _ = device
@@ -2738,14 +2740,18 @@ pub unsafe fn probe_observed(
     // After every USB host left firmware, as Linux's i8042 probe runs after
     // its PCI fixups.
     #[cfg(feature = "native-acpi")]
-    attach_platform(
-        services,
-        smbus_functions,
-        &bridges,
-        firmware,
-        handoff,
-        &mut devices,
-    );
+    {
+        // Named, so its time is not the last controller's.
+        crate::working("ACPI platform devices");
+        attach_platform(
+            services,
+            smbus_functions,
+            &bridges,
+            firmware,
+            handoff,
+            &mut devices,
+        );
+    }
     devices.settle_usb(dma);
     devices
 }

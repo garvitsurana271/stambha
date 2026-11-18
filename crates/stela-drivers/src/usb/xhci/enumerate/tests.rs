@@ -483,6 +483,10 @@ fn an_untrainable_usb3_link_is_an_empty_port_and_a_usb2_port_ignores_cold_attach
             .is_empty()
     );
     assert!(failures.is_empty() && !probes[0].connected);
+    // Empty at its first sample, it still waited out the connect settle
+    // time, after the connected ports, before it counted as empty.
+    assert_eq!(probes.len(), 1);
+    assert!(probes[0].debounce_us > 0, "{:?}", probes[0]);
     assert_eq!(model.borrow().root_status, Some(PP | CAS));
 }
 

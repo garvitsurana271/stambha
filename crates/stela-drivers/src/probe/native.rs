@@ -503,7 +503,11 @@ pub type IntelWifi = wifi::intel::link::Station<
 >;
 
 /// The owners an MT7925 station keeps: its claimed function and BAR0.
-pub type MediatekOwner = (Function<OwnedConfig>, Mapping);
+pub type MediatekOwner = (
+    Function<OwnedConfig>,
+    Mapping,
+    crate::bus::pci::requester::preparation::Attachment,
+);
 
 /// An MT7925 station over its owned function and BAR0.
 pub type MediatekWifi = mediatek::station::Wifi<MediatekOwner>;
@@ -524,18 +528,51 @@ pub(super) unsafe fn mediatek_wifi(
     completion: Option<crate::bus::irq::MsiMessage>,
     mut inputs: mediatek::attach::Inputs,
 ) -> Result<Located<mediatek::attach::Attached<MediatekOwner>>, Failure> {
-    let Claimed {
-        mut function,
-        domain,
-        bars,
-    } = claim(services, address)?;
-    let pci = match mediatek_identity(&mut function) {
+    let refused = |error: ServiceError| (Error::Native(error), None);
+    let minimum = services.minimum_delay().map_err(refused)?;
+    let mut requester = services.prepare_requester(address).map_err(refused)?;
+    if let Err(error) = requester.function_mut().power_up(minimum.as_ref()) {
+        return Err(keep_error(error, requester));
+    }
+    let pci = match mediatek_identity(requester.function_mut()) {
         Ok(pci) => pci,
-        Err(error) => return Err(keep_error(error, (function, domain))),
+        Err(error) => return Err(keep_error(error, requester)),
+    };
+    // MT7925 has no FLR or PM reset (Linux's reset_method is `bus` alone), so
+    // a Secondary Bus Reset of its port is what stops every engine firmware
+    // left, as the GPU cold path does. Without one it is refused.
+    let reset = (|| -> Result<(), Error> {
+        if !requester.bus_reset_available() {
+            return Err(Error::Native(ServiceError::Refused(
+                "MT7925 has no function reset and its bus cannot be reset",
+            )));
+        }
+        requester.reset_bus(minimum.as_ref())?;
+        crate::bus::pci::requester::validate_stopped(requester.function_mut())
+            .map_err(|error| Error::Native(ServiceError::Claim(error)))
+    })();
+    if let Err(error) = reset {
+        return Err(keep_error(error, requester));
+    }
+    // SAFETY: the bus reset above stopped every engine of this function and
+    // its stopped state was revalidated; no Stela submission, IRQ or work
+    // exists yet. Finalization drains the original root before binding.
+    let bound = match unsafe { requester.acknowledge_quiescence() }.finalize() {
+        Ok(bound) => bound,
+        Err(failure) => {
+            return Err((Error::Preparation(failure.error.clone()), Some(Box::new(failure))));
+        }
+    };
+    let domain = bound.attachment.domain();
+    let attachment = bound.attachment;
+    let mut function = bound.requester.into_function();
+    let bars = match function.bars() {
+        Ok(bars) => bars,
+        Err(error) => return Err(keep_error(error, (function, attachment))),
     };
     let registers = match map(services, address, &bars, 0) {
         Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+        Err(error) => return Err(keep_error(Error::Native(error), (function, attachment))),
     };
     let (base, bytes) = match registers
         .bytes()
@@ -545,7 +582,7 @@ pub(super) unsafe fn mediatek_wifi(
         Err(error) => {
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
+                (function, attachment, registers),
             ));
         }
     };
@@ -562,13 +599,13 @@ pub(super) unsafe fn mediatek_wifi(
     })();
     inputs.vector = match configured {
         Ok(vector) => vector,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+        Err(error) => return Err(keep_error(error, (function, attachment, registers))),
     };
     #[expect(
         clippy::arc_with_non_send_sync,
         reason = "The serialized BAR and queue retainers require Arc<dyn Any>; this PCI custody remains !Send and !Sync."
     )]
-    let owner = Arc::new((function, registers));
+    let owner = Arc::new((function, registers, attachment));
     let kept = Box::new(owner.clone()) as Box<dyn Any>;
     // SAFETY: the mount claimed the stopped function, mapped its BAR0
     // uncached and supplied an isolating domain; `owner` keeps the function

@@ -1,0 +1,93 @@
+From 59e4eb37ddff89a793b8ddad5ce013e11608e06d Mon Sep 17 00:00:00 2001
+From: Android Artisan <romartisan2025@gmail.com>
+Date: Sat, 21 Nov 2026 04:28:06 +0000
+Subject: [PATCH] fix(i915): name and recover from the ENOMEM that makes an
+ execbuf pin fail
+
+---
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    |  5 +++
+ drivers/gpu/drm/i915/i915_vma.c               | 43 +++++++++++++++----
+ 2 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index d5aadced7da..960192511b7 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -3638,5 +3638,10 @@ end:;
+ 
+ 	args->flags &= ~__I915_EXEC_UNKNOWN_FLAGS;
+ 	kvfree(exec2_list);
++	if (err == -ENOMEM)
++		drm_err_ratelimited(&i915->drm,
++				    "execbuf ENOMEM buffers=%u flags=%llx\n",
++				    args->buffer_count,
++				    (unsigned long long)args->flags);
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+index afc192d9931..8f2d6db0e53 100644
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -1618,25 +1618,50 @@ err_rpm:
+ 		dma_fence_put(moving);
+ 
+ 	i915_vma_put_pages(vma);
++	if (err == -ENOMEM)
++		drm_err_ratelimited(&vma->vm->i915->drm,
++				    "vma pin ENOMEM size=%llu align=%llu flags=%llx\n",
++				    (unsigned long long)vma->size,
++				    (unsigned long long)alignment,
++				    (unsigned long long)flags);
+ 	return err;
+ }
+ 
+ int i915_vma_pin(struct i915_vma *vma, u64 size, u64 alignment, u64 flags)
+ {
+ 	struct i915_gem_ww_ctx ww;
++	unsigned int retries;
+ 	int err;
+ 
+-	i915_gem_ww_ctx_init(&ww, true);
+-retry:
+-	err = i915_gem_object_lock(vma->obj, &ww);
+-	if (!err)
+-		err = i915_vma_pin_ww(vma, &ww, size, alignment, flags);
+-	if (err == -EDEADLK) {
+-		err = i915_gem_ww_ctx_backoff(&ww);
++	for (retries = 0; retries < 8; retries++) {
++		i915_gem_ww_ctx_init(&ww, true);
++retry_lock:
++		err = i915_gem_object_lock(vma->obj, &ww);
+ 		if (!err)
+-			goto retry;
++			err = i915_vma_pin_ww(vma, &ww, size, alignment, flags);
++		if (err == -EDEADLK) {
++			err = i915_gem_ww_ctx_backoff(&ww);
++			if (!err)
++				goto retry_lock;
++		}
++		i915_gem_ww_ctx_fini(&ww);
++
++		if (err != -ENOMEM)
++			break;
++
++		/*
++		 * execbuf pins a batch of buffers at once. Its request and VMA
++		 * bookkeeping can fail transiently while the objects themselves
++		 * are still pinned elsewhere. Reclaim only unpinned and mapped
++		 * pages, never an active frame, and retry before failing the
++		 * whole submission.
++		 */
++		i915_gem_shrink(NULL, vma->vm->i915, 0, NULL,
++				I915_SHRINK_UNBOUND |
++				I915_SHRINK_BOUND |
++				I915_SHRINK_VMAPS);
++		cond_resched();
+ 	}
+-	i915_gem_ww_ctx_fini(&ww);
+ 
+ 	return err;
+ }
+-- 
+2.53.0
+

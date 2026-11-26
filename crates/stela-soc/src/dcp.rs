@@ -526,6 +526,19 @@ impl Coprocessor {
         Ok(Self { rtkit, link, afk })
     }
 
+    /// Hold the fixed panel lit through the guest's display sleep. A physical
+    /// scanout stays presentable even when macOS asks its framebuffer to sleep,
+    /// so a wake's cursor and the desktop are never lost to a dark sink. The
+    /// guest's own power calls still succeed and see their state.
+    pub fn hold_display_lit(&self) {
+        self.link
+            .borrow()
+            .service()
+            .display_state()
+            .borrow_mut()
+            .hold_lit();
+    }
+
     /// The coprocessor was used and quiesced by the boot chain.
     pub fn quiesced(mut self) -> Self {
         self.rtkit = self.rtkit.quiesced();

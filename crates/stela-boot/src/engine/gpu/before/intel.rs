@@ -197,6 +197,12 @@ impl Drivers {
             if table {
                 words.push(gpu::command_line::video_bios_table(driver, VBT));
             }
+            // Keep the display words the Ice Lake stick used: without them
+            // i915 leaves PSR, panel replay and FBC on, and the panel blinks
+            // black after the GUI logs appear.
+            words.push(gpu::command_line::without_psr(driver));
+            words.push(gpu::command_line::without_panel_replay(driver));
+            words.push(gpu::command_line::without_fbc(driver));
             if controllers.is_some() {
                 words.push(gpu::command_line::without_huc(driver));
                 if kept.is_none() {

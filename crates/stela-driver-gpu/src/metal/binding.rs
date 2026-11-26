@@ -59,6 +59,15 @@ raw_enum! {
 pub const HEAP_SET: u32 = 0;
 /// The null descriptor every array reserves.
 pub const NULL_DESCRIPTOR: u32 = 0;
+/// The most descriptors one heap source count contributes, before it is split
+/// between images and texel buffers. Ice Lake advertises 33M update-after-bind
+/// images from its 2 GiB surface-state VA; asking ANV for all of them makes the
+/// descriptor pool's host allocation exceed a gigabyte. Even 1M sources leaves
+/// a 49 MB indirect-descriptor BO, which adds to the GTT pressure WindowServer
+/// puts on i915. The smallest source count whose three-quarter image share is
+/// Metal tier 2's 500K resources is 666,666; that keeps tier 2 while making
+/// the BO about 33 MB.
+pub const MAX_HEAP_DESCRIPTORS: u32 = 666_666;
 
 /// Two descriptor indices packed as Metal's `MTLResourceID`. A cube
 /// texture's sampled image is followed by its faces' 2D array, which texel
@@ -1204,14 +1213,17 @@ impl HeapLayout {
     pub fn new(limits: &Limits) -> Self {
         let sampled = limits
             .max_descriptor_set_update_after_bind_sampled_images
-            .min(limits.max_per_stage_update_after_bind_sampled_images);
+            .min(limits.max_per_stage_update_after_bind_sampled_images)
+            .min(MAX_HEAP_DESCRIPTORS);
         let storage = limits
             .max_descriptor_set_update_after_bind_storage_images
-            .min(limits.max_per_stage_update_after_bind_storage_images);
+            .min(limits.max_per_stage_update_after_bind_storage_images)
+            .min(MAX_HEAP_DESCRIPTORS);
         let samplers = limits
             .max_descriptor_set_update_after_bind_samplers
             .min(limits.max_per_stage_update_after_bind_samplers)
-            .min(limits.max_sampler_allocation_count);
+            .min(limits.max_sampler_allocation_count)
+            .min(MAX_HEAP_DESCRIPTORS);
         // Storage indices leave the high half's flag and level count bits free.
         let storage = storage.min(ResourceId::MAX_STORAGE);
         Self {
@@ -2589,5 +2601,26 @@ mod tests {
         assert_eq!(heap.allocate(HeapArray::Samplers), Ok(1));
         assert_eq!(heap.in_use(HeapArray::Samplers), 1);
         assert_eq!(heap.in_use(HeapArray::SampledImages), 0);
+    }
+
+    #[test]
+    fn ice_lake_heap_caps_advertised_descriptors() {
+        let mut limits = nvk(&CHIPS[0], 8 << 30).limits;
+        // Ice Lake's 2 GiB bindless surface-state VA gives ANV 33M image
+        // descriptors and 64K sampler descriptors.
+        limits.max_descriptor_set_update_after_bind_sampled_images = 33_554_432;
+        limits.max_per_stage_update_after_bind_sampled_images = 33_554_432;
+        limits.max_descriptor_set_update_after_bind_storage_images = 33_554_432;
+        limits.max_per_stage_update_after_bind_storage_images = 33_554_432;
+        limits.max_descriptor_set_update_after_bind_samplers = 67_108_864;
+        limits.max_per_stage_update_after_bind_samplers = 67_108_864;
+        limits.max_sampler_allocation_count = 64 * 1024;
+        let layout = HeapLayout::new(&limits);
+        assert_eq!(
+            layout.counts,
+            [500_000, 500_000, 64 * 1024, 166_666, 166_666]
+        );
+        assert!(layout.count(HeapArray::SampledImages) >= 500_000);
+        assert!(layout.count(HeapArray::StorageImages) >= 500_000);
     }
 }

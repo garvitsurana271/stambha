@@ -152,6 +152,10 @@ struct InFlight {
     /// The event values its submitted segments signal, reached once it is
     /// done.
     signals: Vec<(Semaphore, u64)>,
+    /// A submission was refused after earlier segments ran: when this flight
+    /// truly completes, Stela must make its signals too, because the driver
+    /// never did.
+    refused: bool,
     /// Every value its submissions signal, completion's included: the
     /// driver names a submission it refused by one of them.
     named: Vec<(Semaphore, u64)>,
@@ -238,6 +242,25 @@ impl Marks {
             stage: PipelineStages::ALL_COMMANDS,
         });
     }
+}
+
+/// The flight's state before one submission was tried. ANV can refuse a
+/// submission after earlier segments of the same command buffer reached the
+/// GPU; restoring this keeps those segments in flight instead of freeing what
+/// they still read. It is not a snapshot of every queue field: `promised`
+/// event values are kept so waiters still wake, and `late_value` is only
+/// advanced.
+#[derive(Clone, Copy, Debug)]
+struct SubmissionState {
+    key: u64,
+    serial: u64,
+    /// The submission calls and segments already counted for this flight.
+    submits: u64,
+    segments: u64,
+    track: Track,
+    /// How many signals in the flight named work that really reached the GPU.
+    named: usize,
+    timeline_serial: u64,
 }
 
 /// What one span between marks drew: the last pass's extent, its draws and
@@ -708,9 +731,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             for (index, color) in plan.color.iter().enumerate() {
                 let Some(color) = color else { continue };
                 let texture = self.texture_descriptor(color.view.texture)?;
-                if !texture
-                    .usage
-                    .contains(crate::metal::abi::TextureUsage::RENDER_TARGET)
+                if texture.sample_count != 1
+                    || !texture
+                        .usage
+                        .contains(crate::metal::abi::TextureUsage::RENDER_TARGET)
                 {
                     continue;
                 }
@@ -1046,6 +1070,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             carried,
             signals: Vec::new(),
             named: Vec::new(),
+            refused: false,
         });
         if held.as_mut_slice().iter().any(|held| {
             held.segments
@@ -1056,10 +1081,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         }
         held.enqueue(&mut self.queue.held);
         self.backend.take_split();
-        // The uploads' submission marks the command buffer started; a
-        // failed one never signals, so the loss is recorded.
+        // The uploads' submission marks the command buffer started. A
+        // refused one is settled with its command buffer, and only a
+        // driver-reported loss loses the device.
         let advanced = match leading {
-            Some(leading) => self.submit_held(leading).inspect_err(|_| self.lost = true),
+            Some(leading) => self.submit_and_settle(leading),
             None => Ok(()),
         }
         .and_then(|()| self.advance());
@@ -1407,8 +1433,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     mappings,
                 }
             };
-            // A failed submission never signals; record the loss so waits end.
-            self.submit_held(held).inspect_err(|_| self.lost = true)?;
+            // A refused submission is settled with its command buffer so
+            // waits end; only a driver-reported loss loses the device.
+            self.submit_and_settle(held)?;
             // What it signals may have readied work passed over.
             if !blocked.is_empty() {
                 blocked.clear();
@@ -1565,6 +1592,104 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             flight.signals.extend(signals);
         }
         Ok(())
+    }
+
+    /// Submits `held`, settling a refusal with just its command buffer.
+    /// Drivers with a submit thread name a refused submission by its signals
+    /// and still make them; ANV returns an allocation failure from execbuf
+    /// without either, so the waits would otherwise never end. A driver that
+    /// reports actual loss still loses the device.
+    fn submit_and_settle(&mut self, held: Held) -> Result<()> {
+        let state = self.submission_state(&held);
+        match self.submit_held(held) {
+            Ok(()) => Ok(()),
+            Err(error) if error == Error::DeviceLost => {
+                self.lost = true;
+                Err(error)
+            }
+            Err(error) => {
+                self.refuse_submission(state, error);
+                Err(error)
+            }
+        }
+    }
+
+    /// The flight's counts, completion and named signals before `held` is
+    /// submitted. A refused submission must undo only its own changes: an
+    /// earlier segment of the same command buffer may still be running.
+    fn submission_state(&self, held: &Held) -> SubmissionState {
+        let (submits, segments, track, named) = self
+            .queue
+            .in_flight
+            .iter()
+            .find(|flight| flight.key == held.key && flight.serial == held.serial)
+            .map_or((0, 0, Track::Held, 0), |flight| {
+                (
+                    flight.submits,
+                    flight.segments,
+                    flight.track,
+                    flight.named.len(),
+                )
+            });
+        SubmissionState {
+            key: held.key,
+            serial: held.serial,
+            submits,
+            segments,
+            track,
+            named,
+            timeline_serial: self.queue.timeline_serial,
+        }
+    }
+
+    /// Settles a submission that did not reach the GPU and keeps the device:
+    /// the rest of its held segments are dropped and its failure is kept for
+    /// `CommandFailure`. With no earlier segment submitted, nothing is running
+    /// and its event signals are reached here. Otherwise the command buffer
+    /// stays in flight until the submitted part completes, so freeing what it
+    /// reads cannot cause a GPU MMU fault.
+    fn refuse_submission(&mut self, state: SubmissionState, error: Error) {
+        let mut signals = Vec::new();
+        let prior = state.submits > 0;
+        if let Some(flight) = self
+            .queue
+            .in_flight
+            .iter_mut()
+            .find(|flight| flight.key == state.key && flight.serial == state.serial)
+        {
+            flight.submits = state.submits;
+            flight.segments = state.segments;
+            flight.named.truncate(state.named);
+            if prior {
+                // The submitted part ends at its late signal; completion
+                // then reaches the refused part's local signals too. ANV
+                // made none of them, so the driver must be told to signal
+                // them when that completion arrives.
+                flight.refused = true;
+                flight.track = match state.track {
+                    Track::Started(value) => Track::Late(value),
+                    track => track,
+                };
+            } else {
+                signals = core::mem::take(&mut flight.signals);
+                flight.track = Track::Done;
+            }
+        }
+        self.queue.timeline_serial = state.timeline_serial;
+        for (semaphore, value) in signals {
+            self.note_reached_event(semaphore, value);
+        }
+        self.queue
+            .held
+            .retain(|held| held.key != state.key || held.serial != state.serial);
+        if !self
+            .queue
+            .refused
+            .iter()
+            .any(|&(refused, at, ..)| refused == state.key && at == state.serial)
+        {
+            self.queue.refused.push((state.key, state.serial, error, 0));
+        }
     }
 
     /// Makes held segments' binds, reading indirect regions from the copies
@@ -2029,12 +2154,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             _ => 0,
         };
         let mut reached_events = Vec::new();
+        let mut refused_signals = Vec::new();
         let mut done = Vec::new();
         for flight in &mut self.queue.in_flight {
             match flight.track {
                 Track::Timeline if flight.serial <= timeline => flight.track = Track::Done,
                 Track::Late(value) if value <= late => flight.track = Track::Done,
                 _ => continue,
+            }
+            // A refused tail's signals were promised, but ANV never made
+            // them. Make them now, before a later submission's GPU wait
+            // could outlive this flight, then reach the local events too.
+            if flight.refused {
+                refused_signals.extend(flight.signals.iter().copied());
             }
             // What it signaled is reached: an event read needs no query.
             reached_events.append(&mut flight.signals);
@@ -2043,6 +2175,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 flight.serial,
                 core::mem::take(&mut flight.named),
             ));
+        }
+        for (semaphore, value) in refused_signals {
+            // A destroyed event's semaphore has no promise and may already
+            // have been handed to a new event; do not signal that.
+            if !self
+                .queue
+                .promised
+                .iter()
+                .any(|&(promised, _)| promised == semaphore)
+            {
+                continue;
+            }
+            self.backend
+                .signal_semaphore(semaphore, value)
+                .inspect_err(|error| self.lost |= lost(error))?;
         }
         for (semaphore, value) in reached_events {
             self.note_reached_event(semaphore, value);

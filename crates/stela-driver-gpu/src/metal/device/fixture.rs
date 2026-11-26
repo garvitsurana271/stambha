@@ -160,6 +160,9 @@ pub(crate) struct MockBackend {
     /// The next submission is refused with this failure while the device
     /// is kept: its signals are still made, as NVK's refusal makes them.
     pub(crate) refuse_next: Option<Error>,
+    /// The next submission fails outright, like ANV's execbuf OOM: none of
+    /// its signals are made and Stela must settle the command buffer.
+    pub(crate) submit_error: Option<Error>,
     /// Submissions the driver refused, by each value they signaled, as
     /// `submit_failure` takes them.
     pub(crate) refused: Vec<(Semaphore, u64, Error)>,
@@ -729,6 +732,12 @@ impl Backend for MockBackend {
         Ok(self.semaphores[&semaphore.0] >= value)
     }
     fn submit(&mut self, segments: &[Segment]) -> Result<()> {
+        // ANV's execbuf failure makes no signal at all. Check it before
+        // promising any, or `finish()` would hide the missing signal Stela
+        // has to make when the already-submitted part completes.
+        if let Some(error) = self.submit_error.take() {
+            return Err(error);
+        }
         for segment in segments {
             for &(semaphore, value) in &segment.waits {
                 let reached = self.semaphores.get(&semaphore.0).copied().unwrap_or(0);

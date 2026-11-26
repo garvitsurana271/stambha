@@ -38,6 +38,19 @@ pub fn bound(pages: usize) -> String {
     format!("ttm.pages_limit={pages}")
 }
 
+/// TTM's retained page pool, 128 MiB of 4 KiB pages per NUMA node. TTM
+/// defaults to half of the node's RAM, which on this 16 GiB host keeps nearly
+/// 4 GiB of freed driver pages in the pool; they never return to Stela's heap,
+/// so an Intel desktop eventually fails `execbuf` with ENOMEM while the page
+/// limit still shows room. A bounded pool returns those pages and keeps the
+/// allocation retries short.
+pub const PAGE_POOL_PAGES: usize = 32 * 1024;
+
+/// The command-line word that bounds TTM's page pool.
+pub fn page_pool() -> String {
+    format!("ttm.page_pool_size={PAGE_POOL_PAGES}")
+}
+
 /// The firmware file the Intel display code of `driver` (`xe` or `i915`,
 /// each of which builds it as its own module's) asks for the video BIOS
 /// table before it looks anywhere else (`intel_bios.c`).
@@ -55,6 +68,22 @@ pub fn without_huc(driver: &str) -> String {
 /// security controller off.
 pub fn without_gsc(driver: &str) -> String {
     format!("{driver}.gsc_firmware_path=")
+}
+
+/// Turns off panel self refresh. Ice Lake's eDP panel blanks when PSR is
+/// left on: the GUI logs appear, then the panel goes black until a modeset.
+pub fn without_psr(driver: &str) -> String {
+    format!("{driver}.enable_psr=0")
+}
+
+/// Turns off panel replay, the PSR successor, for the same blanking reason.
+pub fn without_panel_replay(driver: &str) -> String {
+    format!("{driver}.enable_panel_replay=0")
+}
+
+/// Turns off framebuffer compression for the same blanking reason.
+pub fn without_fbc(driver: &str) -> String {
+    format!("{driver}.enable_fbc=0")
 }
 
 /// The masks amdgpu reads once for every GPU it drives, whose bits are the
@@ -116,7 +145,7 @@ mod tests {
     /// the built objects register, so none is refused or left out.
     #[test]
     fn every_word_the_boot_builds_is_registered() {
-        let mut words = vec![page_limit(655_360), bound(224_256)];
+        let mut words = vec![page_limit(655_360), bound(224_256), page_pool()];
         // Only an image with an Intel driver holds its parameters: its own
         // (i915's in `i915_params.c`, xe's in `xe_module.c`) and those of the
         // display code it builds.
@@ -127,6 +156,9 @@ mod tests {
             if built {
                 words.extend([
                     video_bios_table(driver, "intel/vbt.bin"),
+                    without_psr(driver),
+                    without_panel_replay(driver),
+                    without_fbc(driver),
                     without_huc(driver),
                     without_gsc(driver),
                 ]);
@@ -198,5 +230,6 @@ mod tests {
     fn a_bound_is_ttms_limit_as_it_is() {
         assert_eq!(page_limit(655_360), "ttm.pages_limit=1310720");
         assert_eq!(bound(224_256), "ttm.pages_limit=224256");
+        assert_eq!(page_pool(), "ttm.page_pool_size=32768");
     }
 }

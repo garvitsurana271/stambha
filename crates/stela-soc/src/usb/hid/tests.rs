@@ -292,8 +292,9 @@ fn class_requests_set_leds_protocol_idle_and_halt() {
     assert!(control(&mut p, setup(0x21, SET_PROTOCOL, 0, 1, 0), &[]).is_err());
     let report = control(&mut p, setup(0xa1, GET_REPORT, 0x100, 1, 7), &[]).unwrap();
     assert_eq!(report.len(), POINTER_REPORT);
-    // Only an indefinite idle rate is kept: an unchanged report never repeats.
-    assert!(control(&mut p, setup(0x21, SET_IDLE, 6 << 8, 0, 0), &[]).is_err());
+    // Any idle rate is acknowledged (DriverKit needs the status stage to
+    // terminate its interfaces), but an unchanged report never repeats.
+    control(&mut p, setup(0x21, SET_IDLE, 6 << 8, 0, 0), &[]).unwrap();
     control(&mut p, setup(0x21, SET_IDLE, 0, 0, 0), &[]).unwrap();
     assert_eq!(
         control(&mut p, setup(0xa1, GET_IDLE, 0, 0, 1), &[]).unwrap(),
@@ -309,6 +310,30 @@ fn class_requests_set_leds_protocol_idle_and_halt() {
     assert_eq!(status, [1, 0]);
     control(&mut p, setup(0x02, CLEAR_FEATURE, 0, 0x81, 0), &[]).unwrap();
     assert_ne!(p.packet(0x81, Token::In, &mut buffer), Ok(Reply::Stall));
+}
+
+#[test]
+fn a_nonzero_set_idle_reaches_its_status_stage() {
+    let mut p = Peripheral::new();
+    enumerate(&mut p);
+    // macOS 26's DriverKit HID driver sends a nonzero idle rate. Stalling
+    // it leaves three IOUSBHostInterface objects busy in kernelmanagerd,
+    // which panics the guest 60 seconds into the userspace reboot.
+    for interface in 0..INTERFACES {
+        for rate in [1u16, 6, 0x14] {
+            control(
+                &mut p,
+                setup(0x21, SET_IDLE, rate << 8, interface as u16, 0),
+                &[],
+            )
+            .unwrap_or_else(|()| panic!("SET_IDLE rate {rate} stalled on interface {interface}"));
+        }
+    }
+    // Keeping the request never promises idle repetitions.
+    assert_eq!(
+        control(&mut p, setup(0xa1, GET_IDLE, 0, 0, 1), &[]).unwrap(),
+        [0]
+    );
 }
 
 struct One(Peripheral);

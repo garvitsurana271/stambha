@@ -103,10 +103,12 @@ pub fn link(linux: &Linux, mut drivers: Vec<Driver>) {
         .iter()
         .flat_map(|unit| parameters(unit.object()))
         .collect::<Vec<_>>();
-    assert!(
-        names.iter().any(|name| name == "ttm.pages_limit"),
-        "the image registers no ttm.pages_limit, which the boot sets: {names:?}"
-    );
+    for parameter in ["ttm.pages_limit", "ttm.page_pool_size"] {
+        assert!(
+            names.iter().any(|name| *name == parameter),
+            "the image registers no {parameter}, which the boot sets: {names:?}"
+        );
+    }
     write_parameters(&names);
     let digest = initcalls::write(
         &output.join("captured-units.bin"),

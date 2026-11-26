@@ -37,10 +37,13 @@
 //!
 //! Each input change queues one report. Queues are bounded; when one is
 //! full the newest report replaces its last entry, so the final state
-//! always reaches the host. The device reports changes alone: a nonzero
-//! SET_IDLE rate STALLs, which HID 1.11 7.2.4 lets a device do for a rate it
-//! does not keep, as repeating an unchanged report tells the host nothing
-//! and wakes its driver every time.
+//! always reaches the host. The device reports changes alone: it never
+//! repeats an unchanged report at an idle rate. It still acknowledges any
+//! SET_IDLE rate, including a nonzero one, because macOS's DriverKit HID
+//! driver waits for that status stage before it can terminate its
+//! IOUSBHostInterface objects; stalling the request leaves kernelmanagerd's
+//! registry busy and the guest panics 60 seconds later. GET_IDLE still
+//! reports zero, so the host never expects idle repetitions.
 use super::{BusPeer, Function, Reply, Token, control::Stall};
 use crate::Result;
 use alloc::{collections::VecDeque, vec::Vec};
@@ -639,7 +642,10 @@ impl Peripheral {
                 Ok(Outcome::Done(None))
             }
             (0xa1, GET_IDLE) if interface < count && value == 0 => reply(&[0]),
-            (0x21, SET_IDLE) if interface < count && value == 0 => Ok(Outcome::Done(None)),
+            // Acknowledge any idle rate. We do not repeat unchanged reports,
+            // but DriverKit needs the status stage before it can release its
+            // IOUSBHostInterface objects during a userspace reboot.
+            (0x21, SET_IDLE) if interface < count => Ok(Outcome::Done(None)),
             (0xa1, GET_PROTOCOL) if Self::boot(interface) && value == 0 => {
                 reply(&[self.interfaces[interface].protocol])
             }

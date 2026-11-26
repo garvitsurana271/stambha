@@ -861,7 +861,7 @@ fn a_display_only_integrated_gpu_adds_its_pages_to_the_heap() {
     // gpu/intel planned them before main's budget.
     assert_eq!(
         [display.heap, display.guest, display.gpu].map(|b| b / MIB),
-        [2932, 6144, 256]
+        [2752, 5186, 1536]
     );
     assert!(!GpuMemory::Display.limits_pages());
     assert!(!GpuMemory::Own.limits_pages());
@@ -885,11 +885,11 @@ fn the_plans_line_states_its_rule() {
     };
     assert_eq!(
         bounded(GpuMemory::Display).describe(&display),
-        "a discrete GPU draws and the integrated GPU shows the display: the heap takes 256M \
+        "a discrete GPU draws and the integrated GPU shows the display: the heap takes 1536M \
          more for the integrated GPU's driver and scanout; Linux's pages, the discrete GPU's \
-         system-memory buffers among them, are at most 892M, what the 3316M heap holds past \
+         system-memory buffers among them, are at most 2172M, what the 4596M heap holds past \
          its own 2424M (at least 384M), TTM's limit the same; should the discrete GPU not \
-         start and the integrated one draw, its Metal device works in those 892M"
+         start and the integrated one draw, its Metal device works in those 2172M"
     );
     let shared = Sizes {
         gpu: 2560 * MIB,
@@ -1368,11 +1368,11 @@ fn the_room_for_an_integrated_gpu_costs_only_small_hosts_guest_ram() {
     assert_eq!(
         rows,
         [
-            [[584, 464, 768], [328, 264, 768]],
-            [[568, 420, 768], [312, 220, 768]],
-            [[348, 0, 780], [92, 0, 780]],
-            [[0, 0, 1944], [0, 0, 2184]],
-            [[0, 0, 3592], [0, 0, 3784]],
+            [[584, 464, 768], [584, 464, 768]],
+            [[568, 420, 768], [568, 420, 768]],
+            [[348, 0, 780], [0, 0, 1864]],
+            [[0, 0, 1944], [0, 0, 3384]],
+            [[0, 0, 3592], [0, 0, 4744]],
         ]
     );
 }

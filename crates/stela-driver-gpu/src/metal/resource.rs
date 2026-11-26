@@ -627,7 +627,9 @@ fn attachment_storage(
     image: &mut ImageInfo,
 ) {
     let format = descriptor.pixel_format;
-    let attachment = capabilities.framebuffer_reads && usage.contains(TextureUsage::RENDER_TARGET);
+    let attachment = capabilities.framebuffer_reads
+        && descriptor.sample_count == 1
+        && usage.contains(TextureUsage::RENDER_TARGET);
     let converted =
         !format.describe().encoding().is_exact() && has_texel_storage(descriptor.texture_type);
     let Some(raw) = raw_texel_format(format).filter(|_| attachment || converted) else {

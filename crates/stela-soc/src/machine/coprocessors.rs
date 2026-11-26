@@ -267,6 +267,11 @@ impl AppleDevices {
             self.validate_native_dart("DCP surface", dart, stream)?;
         }
         let mut coprocessor = dcp::Coprocessor::for_external(scanout, window, identity, build)?;
+        // This machine has one fixed panel behind the DCPEXT pipe. macOS may
+        // ask its framebuffer to sleep while the guest still presents a login
+        // cursor; keep the physical output lit so that cursor and its desktop
+        // stay visible. The guest's own power calls still see their state.
+        coprocessor.hold_display_lit();
         if quiesced {
             coprocessor = coprocessor.quiesced();
         }

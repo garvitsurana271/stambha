@@ -337,11 +337,15 @@ pub struct Capabilities {
     /// `supportsMemorylessRenderTargets`: memoryless textures, backed by
     /// device memory that no pass loads or stores.
     pub memoryless_render_targets: bool,
-    /// `isFramebufferReadSupported`: `[[color(n)]]` reads of any color
-    /// attachment, ordered among the overlapping fragments of a draw, which
-    /// read and write the attachment as storage in a fragment shader
-    /// interlock section.
+    /// `isFramebufferReadSupported`: `[[color(n)]]` reads of any single-sample
+    /// color attachment, ordered among the overlapping fragments of a draw,
+    /// which read and write the attachment as storage in a fragment shader
+    /// interlock section. Core Animation's two-plane framebuffers use these.
     pub framebuffer_reads: bool,
+    /// Whether framebuffer reads also hold on multisample attachments. Vulkan
+    /// needs storage images of them, which some drivers, ANV among them, do
+    /// not offer; those devices keep single-sample framebuffer reads.
+    pub framebuffer_reads_multisample: bool,
     /// Fragment functions can run the fragment tests themselves, on copies
     /// of the pass's depth and stencil attachments in their interlock
     /// section: those that write the stencil reference on a device without
@@ -837,9 +841,11 @@ impl Derivation<'_> {
         let framebuffer_reads = raster_order_groups
             && self.check(api(
                 "framebuffer reads",
-                features.dynamic_rendering_local_read && features.shader_storage_image_multisample,
+                features.dynamic_rendering_local_read,
                 ApiFeatures::EMPTY,
             ));
+        let framebuffer_reads_multisample =
+            framebuffer_reads && features.shader_storage_image_multisample;
         // A stencil output without stencil export, or storage attachments
         // whose pipeline cannot test fragments first: the function tests
         // fragments on storage copies of the attachments, which image copies
@@ -1134,6 +1140,7 @@ impl Derivation<'_> {
             statistic_counters: statistics,
             memoryless_render_targets: true,
             framebuffer_reads,
+            framebuffer_reads_multisample,
             fragment_tests,
             stencil_export: limits.stencil_export,
             stencil_follows_depth,
@@ -1200,13 +1207,13 @@ impl Derivation<'_> {
             .collect()
     }
 
-    /// Whether fragment functions may write attachments as storage in their
-    /// interlock section: framebuffer reads' requirements, unrecorded.
+    /// Whether fragment functions may write single-sample attachments as
+    /// storage in their interlock section: framebuffer reads' requirements,
+    /// unrecorded. Multisample storage is a separate feature.
     fn storage_attachments(&self) -> bool {
         let features = &self.device.features;
         features.fragment_shader_pixel_interlock
             && features.dynamic_rendering_local_read
-            && features.shader_storage_image_multisample
             && self.shaders.contains(ShaderFeatures::RASTER_ORDER_GROUPS)
     }
 

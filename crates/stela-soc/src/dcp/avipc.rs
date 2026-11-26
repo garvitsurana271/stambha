@@ -108,6 +108,9 @@ pub struct DisplayState {
     /// None until an explicit power request.
     pub(super) powered: Option<bool>,
     pub(super) asleep: bool,
+    /// A fixed internal panel that stays lit while the guest asks its
+    /// framebuffer to sleep, so a wake's cursor is not lost to a dark sink.
+    hold_lit: bool,
     hotplug_requested: bool,
 }
 
@@ -117,13 +120,22 @@ impl DisplayState {
             default_power,
             powered: None,
             asleep: false,
+            hold_lit: false,
             hotplug_requested: false,
         }
     }
 
-    /// Current output follows requests, or its explicitly configured default.
+    /// Keep the fixed panel lit through the guest's display sleep. The guest
+    /// still sees its own power requests succeed; only the physical output is
+    /// held on, so the desktop and cursor it presents are never darkened.
+    pub(super) fn hold_lit(&mut self) {
+        self.hold_lit = true;
+    }
+
+    /// Current output follows requests, or its explicitly configured default,
+    /// unless the fixed panel is held lit for the guest's display sleep.
     pub(super) fn active(&self) -> bool {
-        self.powered.unwrap_or(self.default_power) && !self.asleep
+        self.hold_lit || (self.powered.unwrap_or(self.default_power) && !self.asleep)
     }
 
     pub(super) fn take_hotplug_request(&mut self) -> bool {

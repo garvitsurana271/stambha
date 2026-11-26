@@ -284,6 +284,7 @@ fn missing_families_name_the_layer_that_lacks_them() {
     assert_eq!(cause("raster order groups"), None);
     assert_eq!(cause("framebuffer reads"), None);
     assert!(capabilities.framebuffer_reads);
+    assert!(capabilities.framebuffer_reads_multisample);
     assert_eq!(cause("GPU family Metal4"), Some(Cause::AppleArchitecture));
     assert_eq!(cause("ASTC LDR pixel formats"), None);
     assert_eq!(cause("ASTC HDR pixel formats"), None);

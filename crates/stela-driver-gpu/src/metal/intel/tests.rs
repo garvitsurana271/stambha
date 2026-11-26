@@ -1,5 +1,11 @@
 use super::*;
-use crate::metal::open::PcieLink;
+use crate::metal::{
+    abi::GpuFamily,
+    capabilities::{ApiFeatures, Capabilities, ShaderFeatures},
+    nvidia::{Chip, fixture::nvk},
+    open::PcieLink,
+    vulkan::physical::HeapLayout,
+};
 
 /// ANV's identity of Tiger Lake's UHD Graphics 0x9a49.
 fn tiger_lake() -> Identity {
@@ -162,4 +168,59 @@ fn the_gpus_i915_is_handed_are_admitted_with_i915s_platform_name() {
             device: 0x1616
         }))
     );
+}
+
+/// ANV exposes programmable blending and local reads on Ice Lake but no
+/// multisample storage images. Core Animation's single-sample two-plane
+/// framebuffers still put the device in Apple3.
+#[test]
+fn anv_without_multisample_storage_claims_apple3() {
+    let mut device = nvk(Chip::find(0x1b3).unwrap(), 16 << 30);
+    device.identity = Identity {
+        api_version: (1 << 22) | (4 << 12),
+        driver_id: DriverId::IntelOpenSourceMesa,
+        driver_version: 0,
+        vendor_id: VENDOR_ID,
+        device_id: 0x8a56,
+        pipeline_cache_uuid: [0; 16],
+        device_type: PhysicalDeviceType::IntegratedGpu,
+        device_name: String::from("Intel(R) UHD Graphics (ICL GT1)"),
+        conformance_version: [1, 4, 0, 0],
+        pci_bus: None,
+    };
+    device.features.shader_storage_image_multisample = false;
+    device.features.sparse_binding = false;
+    device.features.sparse_residency_buffer = false;
+    device.features.sparse_residency_image_2d = false;
+    device.features.sparse_residency_image_3d = false;
+    device.features.sparse_residency_samples = crate::metal::vulkan::SampleCounts::EMPTY;
+    device.features.mesh_shader = false;
+    device.features.task_shader = false;
+    device.features.fragment_shader_barycentric = false;
+
+    let platform = Platform {
+        architecture: String::from("ICELAKE"),
+        location: DeviceLocation::BuiltIn,
+        location_number: 1,
+        max_transfer_rate: 0,
+        headless: false,
+        removable: false,
+        linear_row_alignment: 16,
+        linear_offset_alignment: 16,
+        sparse_page_bytes: 64 << 10,
+        heaps: HeapLayout::Disjoint,
+    };
+    let capabilities = Capabilities::derive(
+        &device,
+        &platform,
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+    );
+    assert!(capabilities.framebuffer_reads);
+    assert!(!capabilities.framebuffer_reads_multisample);
+    for family in [GpuFamily::Apple1, GpuFamily::Apple2, GpuFamily::Apple3] {
+        assert!(capabilities.supports_family(family), "{family:?}");
+    }
+    assert!(!capabilities.supports_family(GpuFamily::Apple7));
+    assert!(!capabilities.supports_family(GpuFamily::Metal3));
 }

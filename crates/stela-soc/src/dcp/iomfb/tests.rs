@@ -947,6 +947,48 @@ fn power_and_sleep_gate_scanout() {
     assert_eq!(&callback.input[..8], &PLUGGED.to_le_bytes());
 }
 
+#[test]
+fn a_held_lit_panel_stays_active_through_guest_sleep() {
+    use super::super::avipc::{COMMAND_PACKET_TYPE, Controller};
+    let display = Rc::new(RefCell::new(DisplayState::new(true)));
+    display.borrow_mut().hold_lit();
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let frames = screen.0.clone();
+    let mut methods =
+        Methods::with_display_state(Box::new(screen), Rc::clone(&display), interface());
+    let mut controller = Controller::new(display);
+    let mut command = |index: u32, value: Option<u64>| {
+        let size: u32 = if value.is_some() { 0x20 } else { 0x10 };
+        let mut bytes = alloc::vec![0; 0x40 + size as usize];
+        bytes[4..8].copy_from_slice(&index.to_le_bytes());
+        bytes[8..12].copy_from_slice(&size.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0x6970_6378u32.to_le_bytes());
+        if let Some(value) = value {
+            bytes[0x50..0x58].copy_from_slice(&value.to_le_bytes());
+        }
+        let (status, reply) = controller.handle(COMMAND_PACKET_TYPE, &bytes).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(&reply[0x40..0x44], &[0; 4]);
+        reply
+    };
+
+    start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(1, &[]), 0xc));
+    // The guest powers the display off and then asks it to sleep.
+    command(6, Some(0));
+    command(9, None);
+    assert_eq!(methods.shared_variables(), [1, 0, 0]);
+    // The fixed panel still presents the newest frame, cursor included.
+    methods
+        .present(0, |_, _| panic!("held-lit scanout reads no pixels"))
+        .unwrap();
+    assert_eq!(frames.borrow().len(), 1);
+    // IOMFB's own setPowerState(0) cannot darken it either.
+    let off = Packed::new().u64(0).finish(0x10).unwrap();
+    returned(methods.call(*b"A484", &off, 8));
+    assert_eq!(methods.shared_variables(), [1, 0, 0]);
+}
+
 fn started_ids(methods: &Methods) -> Vec<u32> {
     methods.started.iter().map(|&(id, _)| id).collect()
 }

@@ -18,6 +18,25 @@ use alloc::vec::Vec;
 /// holds 16 KiB of resources there, and `currentAllocatedSize` says so.
 pub const PAGE: u64 = 16_384;
 
+/// The size of the automatic heaps Core Animation fills to their last byte
+/// before asking for another 256 KiB buffer. The guest asked for a 4 MiB
+/// heap and then filled it; on a Mac the heap answer is final, but here the
+/// heap is ours to size, so give that one size room for the late buffers
+/// instead of answering nil and pushing the guest into execbuf ENOMEM.
+const AUTOMATIC_HEADROOM_FROM: u64 = 4 << 20;
+const AUTOMATIC_HEADROOM_TO: u64 = 16 << 20;
+
+/// The bytes an automatic heap backs. Only the 4 MiB size Core Animation
+/// fills gets headroom: every other size, and every placement or sparse
+/// heap, keeps the exact capacity the guest asked for.
+pub fn automatic_bytes(size: u64) -> u64 {
+    if size == AUTOMATIC_HEADROOM_FROM {
+        AUTOMATIC_HEADROOM_TO
+    } else {
+        size
+    }
+}
+
 /// The alignment a Mac answers for every heap texture the Apple layout
 /// covers ([`apple_texture`]).
 const APPLE_ALIGNMENT: u64 = 128;

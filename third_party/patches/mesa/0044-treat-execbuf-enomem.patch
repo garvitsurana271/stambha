@@ -1,0 +1,75 @@
+From 2c24cae28bf00c6775618ea8afa163c5c0e218a8 Mon Sep 17 00:00:00 2001
+From: Android Artisan <romartisan2025@gmail.com>
+Date: Thu, 26 Nov 2026 09:13:30 +0100
+Subject: [PATCH] fix(i915): keep execbuf ENOMEM recoverable and retry the
+ frame
+
+---
+ src/intel/common/intel_gem.h            | 10 ++++++----
+ src/intel/vulkan/i915/anv_batch_chain.c | 26 +++++++++++++++++++++----
+ 2 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/src/intel/common/intel_gem.h b/src/intel/common/intel_gem.h
+index 51ec8f0d4..c99191855 100644
+--- a/src/intel/common/intel_gem.h
++++ b/src/intel/common/intel_gem.h
+@@ -141,11 +141,13 @@ bool intel_gem_supports_protected_context(int fd,
+                                           enum intel_kmd_type kmd_type);
+ 
+ /* Definitions used by the execbuf ioctl wrappers in the backends.
+- * With the values below, after 80 retries we have slept ~16s, and the warning
+- * is given at ~2s.
++ * With the values below, after 20 retries we have slept ~0.25s, and the
++ * warning is given at ~0.06s. The old 80-retry/16s and 40-retry/2s windows
++ * outlived the macOS GPU lock timeout and turned a persistent ENOMEM into a
++ * watchdog panic.
+  */
+-#define INTEL_EXEC_IOCTL_MAX_RETRIES 80
+-#define INTEL_EXEC_IOCTL_RETRY_WARN 40
++#define INTEL_EXEC_IOCTL_MAX_RETRIES 20
++#define INTEL_EXEC_IOCTL_RETRY_WARN 10
+ static inline int
+ intel_exec_ioctl_sleep_us(int retries)
+ {
+diff --git a/src/intel/vulkan/i915/anv_batch_chain.c b/src/intel/vulkan/i915/anv_batch_chain.c
+index 532ea1275..599e23a1a 100644
+--- a/src/intel/vulkan/i915/anv_batch_chain.c
++++ b/src/intel/vulkan/i915/anv_batch_chain.c
+@@ -700,12 +700,30 @@ anv_gem_execbuffer_impl(struct anv_queue *queue,
+ {
+    struct anv_device *device = queue->device;
+ 
+-   int ret = i915_gem_execbuf_ioctl(device->fd, device->info, execbuf);
+-   if (ret) {
+-      return anv_queue_set_lost(queue, errno, "%s(%d) failed: %m", func, line);
++   /* i915 can return ENOMEM while allocating request/fence bookkeeping. The
++    * ioctl wrapper already retries briefly; repeat the whole submit a few
++    * more times so WindowServer keeps presenting the desktop instead of
++    * dropping the frame. The total stays well inside the GPU lock timeout,
++    * and a queue is never lost because of a transient allocation failure.
++    */
++   for (unsigned attempt = 0; attempt < 3; attempt++) {
++      int ret = i915_gem_execbuf_ioctl(device->fd, device->info, execbuf);
++      if (!ret)
++         return VK_SUCCESS;
++
++      const int err = errno;
++      if (err != ENOMEM)
++         return anv_queue_set_lost(queue, err, "%s(%d) failed: errno=%d",
++                                   func, line, err);
++
++      if (attempt + 1 == 3)
++         return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                          "%s(%d) execbuf ENOMEM: errno=%d", func, line, err);
++
++      os_time_sleep(250 * (attempt + 1));
+    }
+ 
+-   return VK_SUCCESS;
++   return VK_ERROR_OUT_OF_DEVICE_MEMORY; /* unreachable */
+ }
+ 
+ static void
+-- 
+2.53.0
+

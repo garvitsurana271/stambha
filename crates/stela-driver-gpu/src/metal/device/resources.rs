@@ -1520,6 +1520,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .image
             .ok_or(Error::Invalid("texture buffers are not attachments"))?;
         let descriptor = texture.descriptor;
+        if descriptor.sample_count > 1
+            && !self.capabilities.framebuffer_reads_multisample
+            && !self.capabilities.fragment_tests
+        {
+            return Err(Error::Unsupported(
+                "framebuffer reads of multisample attachments",
+            ));
+        }
         let planes = descriptor.texture_type == crate::metal::abi::TextureType::D3;
         let level = view.range.base_mip_level;
         let extent = [
@@ -2519,9 +2527,18 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         let memory_types = sparse.as_ref().map_or(u32::MAX, |heap| heap.memory_types);
         // A Mac holds whole pages of resources whatever size was asked.
+        // A 4 MiB automatic heap also holds headroom for the late buffers
+        // Core Animation places after filling that exact size.
         let bytes = match sparse {
             Some(_) => plan.size,
-            None => plan.size.next_multiple_of(heap::PAGE),
+            None => {
+                let rounded = plan.size.next_multiple_of(heap::PAGE);
+                if descriptor.heap_type == HeapType::Automatic {
+                    heap::automatic_bytes(rounded)
+                } else {
+                    rounded
+                }
+            }
         };
         let memory = self.make_memory(bytes, plan.memory, memory_types)?;
         self.allocated += bytes;

@@ -374,6 +374,26 @@ fn blended_extended_range_attachments_blend_as_storage() {
 }
 
 #[test]
+fn multisample_framebuffer_reads_need_multisample_storage() {
+    let mut capabilities = capabilities();
+    capabilities.framebuffer_reads_multisample = false;
+    let mut fragment = interface(Stage::Fragment);
+    fragment.attachment_reads = 1;
+    let mut targets = RenderTargets::default();
+    targets.raster_sample_count = 4;
+    targets.color_attachments[0] = color(PixelFormat::Rgba8Unorm);
+    assert_eq!(
+        storage_attachments(&capabilities, &fragment, &targets),
+        Err(Error::Unsupported(
+            "framebuffer reads of multisample attachments"
+        ))
+    );
+    // Single-sample reads still work with only dynamic local reads.
+    targets.raster_sample_count = 1;
+    assert!(storage_attachments(&capabilities, &fragment, &targets).is_ok());
+}
+
+#[test]
 fn lines_rasterize_as_apple_gpus_draw_them() {
     let capabilities = capabilities();
     let vertex = shader(Stage::Vertex, 1, |_| {});

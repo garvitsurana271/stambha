@@ -152,11 +152,13 @@ const GPU_LEAST: u64 = 256 * MIB;
 
 /// What an integrated GPU that only shows the display (beside a discrete
 /// GPU that draws) takes of the heap beside its own needs: its driver's
-/// pages that its carve-out does not hold, and a few scanout and cursor
-/// buffers, 32 MiB each at 3840x2160. Linux's pages are not bounded then:
-/// the discrete GPU's system-memory buffers (TTM's system pages, a GTT,
-/// page tables) come from the heap as its floor was measured with.
-pub const DISPLAY_SHARE: u64 = 256 * MIB;
+/// pages that its carve-out does not hold, scanout and cursor buffers, and
+/// room for the Metal device it must open if the discrete GPU never starts.
+/// Linux's pages are not bounded then: the discrete GPU's system-memory
+/// buffers (TTM's system pages, a GTT, page tables) come from the heap as its
+/// floor was measured with. The bigger reserve also raises the page bound an
+/// integrated GPU that draws after all budgets its Metal device by.
+pub const DISPLAY_SHARE: u64 = 1536 * MIB;
 
 /// What the heap's own allocations held at most beside an integrated GPU's
 /// pages: a 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of the driver's
@@ -187,10 +189,11 @@ pub const FALLBACK_OPEN: u64 = 480 * MIB;
 pub const FALLBACK_LEAST: u64 = 768 * MIB;
 
 /// The least of Linux's pages an integrated GPU needs free under their bound
-/// for its driver to bind it at all: what one that only shows the display
-/// takes ([`DISPLAY_SHARE`]). With less, a fallback to it is refused
-/// ([`fallback_pages`]).
-pub const FALLBACK_START: u64 = DISPLAY_SHARE;
+/// for its driver to bind it at all: its driver's pages and a few scanout and
+/// cursor buffers, as a GPU that only shows the display takes. With less, a
+/// fallback to it is refused ([`fallback_pages`]). This is the driver's floor,
+/// not the larger [`DISPLAY_SHARE`] the plan reserves for it.
+pub const FALLBACK_START: u64 = 256 * MIB;
 
 /// The page tables a driver's mapping of a whole device-memory aperture of
 /// `bytes` takes from the heap: Stela's page window maps device memory in

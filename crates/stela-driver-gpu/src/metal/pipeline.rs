@@ -707,6 +707,11 @@ pub fn storage_attachments(
     if accessed == 0 {
         return Ok(attachments);
     }
+    if targets.raster_sample_count > 1 && !capabilities.framebuffer_reads_multisample {
+        return Err(Error::Unsupported(
+            "framebuffer reads of multisample attachments",
+        ));
+    }
     if fragment.attachment_reads != 0 {
         require(capabilities.framebuffer_reads, "framebuffer reads")?;
     }

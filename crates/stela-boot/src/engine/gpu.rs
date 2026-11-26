@@ -2977,6 +2977,13 @@ impl Setup {
             crate::native_memory::gpu_share() / 4096,
             crate::native_memory::gpu_page_limit(),
         ));
+        // Cap TTM's retained page pool whatever the GPU plan: its default of
+        // half of RAM leaves freed driver pages in Stela's heap until the
+        // Intel device's execbuf runs out of memory.
+        let pool = gpu::command_line::page_pool();
+        if !words.iter().any(|seen| seen == &pool) {
+            words.push(pool);
+        }
         let (command_line, left_out) = gpu::command_line::compose(words);
         Self {
             command_line,

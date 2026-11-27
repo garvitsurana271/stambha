@@ -86,6 +86,7 @@ impl ParseState<'_> {
                     return Err(Error::DuplicatePackPreload);
                 }
             }
+            IO_CSTATES => options.io_cstates = true,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

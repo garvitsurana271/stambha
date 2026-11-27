@@ -37,8 +37,8 @@ pub(crate) mod entries;
 mod tsc;
 pub(crate) use pe::loaded_extent;
 use stela_boot_core::pe;
-pub(crate) use tsc::identity_mapped;
 pub use tsc::{TscSource, adopt as adopt_tsc, tsc_hz, tsc_source, tsc_tolerance_ppm};
+pub(crate) use tsc::{identity_mapped, pm_timer_port};
 
 /// What the host storage check runs with after boot services end.
 pub struct Handoff {

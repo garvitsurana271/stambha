@@ -149,15 +149,25 @@ pub(crate) fn in_interrupt() -> bool {
 /// is put back less the time slept; a periodic or TSC-deadline timer, or a
 /// timer not yet measured, leaves the caller to poll.
 pub(crate) fn sleep_for(micros: u64) {
-    if micros == 0 || crate::native_clock::host_sleep(micros) {
-        return;
+    let _ = try_sleep_for(micros);
+}
+
+/// Like [`sleep_for`], returning `true` when this processor entered an idle
+/// wait (via the host clock or its local APIC one-shot timer) and `false` when
+/// no timer was available to wake it.
+pub(crate) fn try_sleep_for(micros: u64) -> bool {
+    if micros == 0 {
+        return false;
+    }
+    if crate::native_clock::host_sleep(micros) {
+        return true;
     }
     const MASKED: u32 = 1 << 16;
     const MODE: u32 = 3 << 17;
     let state = state();
     let lvt = state.apic.read(apic::LVT_TIMER);
     if state.apic_hz == 0 || lvt & MODE != 0 {
-        return;
+        return false;
     }
     let remaining = state.apic.read(apic::CURRENT);
     let armed = lvt & MASKED == 0 && remaining != 0;
@@ -183,6 +193,7 @@ pub(crate) fn sleep_for(micros: u64) {
         apic::INITIAL,
         if armed { (remaining - slept).max(1) } else { 0 },
     );
+    true
 }
 
 pub(crate) fn completion_signal(id: u64) -> Option<stela_drivers::bus::irq::MsiMessage> {

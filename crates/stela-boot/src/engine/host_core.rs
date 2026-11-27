@@ -17,7 +17,7 @@
 use super::{gpu, host, output, service};
 use crate::{apic::Apic, native_smp::executor::Executors};
 use alloc::{boxed::Box, format, string::String};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use stela_boot_core::host_core::{Channel, Shares, State, Taker, Turn, percent};
 use stela_engine::machine::engine::GuestWatch;
 
@@ -28,6 +28,11 @@ pub(super) static SHARES: Shares = Shares::new();
 
 /// The host core's `host::processor` index, `u32::MAX` before it runs.
 static PROCESSOR: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The host core's APIC ID, for waking it when GPU work arrives while it
+/// sleeps ([`wake_if_sleeping`]).
+static APIC_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Whether the host core is currently halted in [`pause`].
+static SLEEPING: AtomicBool = AtomicBool::new(false);
 
 /// Its passes that ran a service turn, and those that found GPU work ready,
 /// since the last [`report`].
@@ -62,6 +67,26 @@ pub(super) fn takes_pump() -> bool {
     )
 }
 
+/// Wake the host core with a doorbell IPI if it is currently serving and
+/// sleeping in [`pause`], so raised GPU work does not wait for the next
+/// service timer.
+pub(super) fn wake_if_sleeping() -> bool {
+    if !takes_pump() || !SLEEPING.load(Ordering::Acquire) {
+        return false;
+    }
+    let apic = APIC_ID.load(Ordering::Relaxed);
+    if apic == u32::MAX {
+        return false;
+    }
+    let flags: u64;
+    // SAFETY: CPL0 IF save, restored below; ICR write requires interrupts off.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    super::host::ring(apic);
+    // SAFETY: the save above, on this processor.
+    unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
+    true
+}
+
 /// Hand the host core its loop and check that it answers, before the
 /// guest starts: `pes` PEs run on the others. Nothing without a host core;
 /// without an answer the boot goes on as without it.
@@ -71,6 +96,7 @@ pub(super) fn start(executors: &Executors, sender: &Apic, tsc_hz: u64, pes: usiz
     };
     let apic = processor.apic_id();
     let slot = processor.slot();
+    APIC_ID.store(u32::try_from(apic).unwrap_or(u32::MAX), Ordering::Release);
     if let Err(error) = processor.spawn(Box::new(move |_| run(tsc_hz, pes)), sender, tsc_hz) {
         output::arguments(format_args!(
             "HOST CORE fallback: its loop was not taken ({error}); PE 0 serves the host and pumps the GPUs\n"
@@ -97,14 +123,18 @@ fn run(tsc_hz: u64, pes: usize) -> ! {
     PROCESSOR.store(host::processor(), Ordering::Release);
     // No PE's guest waits on this core: a turn never ends for guest work.
     let watch = GuestWatch::new(None, pes, 0, None);
-    let micros = tsc_hz / 1_000_000;
+    let micros = (tsc_hz / 1_000_000).max(1);
+    let service_ticks = micros * SERVICE_MICROS;
+    let fallback_ticks = micros * PAUSE_MICROS;
     let mut served = host::rdtsc();
     loop {
         crate::native_mmio::shootdown::service();
-        match CHANNEL.turn(host::fresh_counter()) {
+        let mut pumped = false;
+        let turn = CHANNEL.turn(host::fresh_counter());
+        match turn {
             Turn::Serve => {
                 let now = host::rdtsc();
-                if now.wrapping_sub(served) >= micros * SERVICE_MICROS {
+                if now.wrapping_sub(served) >= service_ticks {
                     served = now;
                     service::serve(false, false, &watch);
                     // The translation pack's background preload, a
@@ -114,24 +144,45 @@ fn run(tsc_hz: u64, pes: usize) -> ! {
                 }
                 if gpu::pump_host_core() {
                     PUMPS.fetch_add(1, Ordering::Relaxed);
+                    pumped = true;
                 }
             }
             Turn::Idle => {}
             Turn::Leave => break,
         }
-        pause(micros * PAUSE_MICROS);
+        let wakeable = matches!(turn, Turn::Serve);
+        let wait_us = if pumped {
+            PAUSE_MICROS
+        } else {
+            let elapsed = host::rdtsc().wrapping_sub(served);
+            let left_us = service_ticks.saturating_sub(elapsed) / micros;
+            left_us.clamp(PAUSE_MICROS, SERVICE_MICROS)
+        };
+        pause(wait_us, fallback_ticks, wakeable);
     }
     // Stopped: it serves nothing more, and answers shootdowns for good.
     loop {
         crate::native_mmio::shootdown::service();
-        pause(micros * PAUSE_MICROS);
+        pause(1000, fallback_ticks, false);
     }
 }
 
-fn pause(ticks: u64) {
-    let start = host::rdtsc();
-    while host::rdtsc().wrapping_sub(start) < ticks {
-        core::hint::spin_loop();
+fn pause(wait_us: u64, fallback_ticks: u64, wakeable: bool) {
+    // Halted, the host core uses no window translation: shootdowns count it
+    // as acknowledged until it wakes, and it flushes first then.
+    let _idle = crate::native_mmio::shootdown::idle();
+    if wakeable {
+        SLEEPING.store(true, Ordering::Release);
+    }
+    let slept = host::try_sleep_for(wait_us);
+    if wakeable {
+        SLEEPING.store(false, Ordering::Release);
+    }
+    if !slept {
+        let start = host::rdtsc();
+        while host::rdtsc().wrapping_sub(start) < fallback_ticks {
+            core::hint::spin_loop();
+        }
     }
 }
 

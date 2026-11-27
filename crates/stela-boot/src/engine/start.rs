@@ -2988,6 +2988,7 @@ fn start_platform(
     }
     crate::native_idle::install(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
+        options.io_cstates,
     );
     if let (Some(acpi), Some(mmio)) = (host_acpi, native_mmio) {
         takeover_part("PCI ports", &PCI_PORTS);

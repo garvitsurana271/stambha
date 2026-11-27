@@ -441,6 +441,13 @@ pub const TIER2_CHECK: &str = "--tier2-check";
 /// writes, so the options revision stays 13.
 pub const PACK_PRELOAD: &str = "--pack-preload";
 
+/// Admits ACPI `_CST` System I/O C2/C3 states (`--io-cstates`, off by
+/// default): on AMD platforms whose deeper idle states (CC6) are declared as
+/// System I/O ports rather than MWAIT hints, opting in lets idle cores enter
+/// them. A hand-written opt-in setup never writes, so the options revision
+/// stays 13.
+pub const IO_CSTATES: &str = "--io-cstates";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -792,6 +799,9 @@ pub struct System {
     /// Preload the translation pack in the background ([`PACK_PRELOAD`]):
     /// `None` unless given, which does not preload ([`Self::pack_preload`]).
     pub pack_preload: Option<bool>,
+    /// Admit ACPI `_CST` System I/O C2/C3 states ([`IO_CSTATES`]); off by
+    /// default until tested across more firmware.
+    pub io_cstates: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -945,6 +955,7 @@ impl Default for System {
             tier2: None,
             tier2_check: false,
             pack_preload: None,
+            io_cstates: false,
             laptop: None,
             hybrid_scanout: None,
             asus_mode: None,
@@ -1574,6 +1585,7 @@ impl fmt::Display for System {
             PACK_PRELOAD,
             self.pack_preload.map(|on| if on { "on" } else { "off" }),
         )?;
+        line.flag(IO_CSTATES, self.io_cstates)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(
             HYBRID_SCANOUT,

@@ -172,6 +172,20 @@ fn stalled_hz() -> u64 {
 }
 
 /// The firmware's timers this PC has, before ExitBootServices.
+use core::sync::atomic::AtomicU16;
+
+/// ACPI FADT PM timer 16-bit I/O port, when present (for serializing C2/C3
+/// System I/O exit in `native_idle`, matching Linux's `acpi_idle_do_entry`).
+static PM_TIMER_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// The ACPI PM timer port discovered from the FADT, if any.
+pub(crate) fn pm_timer_port() -> Option<u16> {
+    match PM_TIMER_PORT.load(Ordering::Relaxed) {
+        0 => None,
+        port => Some(port),
+    }
+}
+
 struct Timers {
     pm: Option<Pm>,
     hpet: Option<Hpet>,
@@ -187,9 +201,12 @@ fn measure_against_timers() -> Option<(Calibrated, TscSource)> {
         pm: unsafe { acpi::find(rsdp, b"FACP") }
             .ok()
             .and_then(|table| pm_timer::Prepared::from_fadt(table).ok())
-            .map(|prepared| Pm {
-                port: prepared.port,
-                mask: prepared.mask,
+            .map(|prepared| {
+                PM_TIMER_PORT.store(prepared.port, Ordering::Relaxed);
+                Pm {
+                    port: prepared.port,
+                    mask: prepared.mask,
+                }
             }),
         // SAFETY: as above.
         hpet: unsafe { acpi::find(rsdp, b"HPET") }

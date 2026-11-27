@@ -63,10 +63,22 @@ fn declared(kind: u64, latency: u64, class: u8, access: u8, hint: u64) -> CState
 const SKYLAKE: Cpu = Cpu {
     mwait_vendor: true,
     intel: true,
+    amd: false,
     // Extensions and interrupt break; C0..C4 substates.
     mwait: Some((3, 0x0011_1120)),
     always_running_timer: true,
     nonstop_tsc: true,
+    allow_io: false,
+};
+
+const ZEN5: Cpu = Cpu {
+    mwait_vendor: true,
+    intel: false,
+    amd: true,
+    mwait: Some((3, 0x0000_0011)),
+    always_running_timer: true,
+    nonstop_tsc: true,
+    allow_io: true,
 };
 
 #[test]
@@ -130,18 +142,65 @@ fn without_mwait_c1_halts_and_deeper_states_stay_out() {
     ] {
         assert_eq!(admit(&cst, &cpu).1[0].1, refusal);
     }
-    // No C1 declared: HLT stands in; system I/O entries are refused.
+    // No C1 declared: HLT stands in; an invalid zero I/O port is refused.
     let (admitted, refused) = admit(
         &[CState {
             kind: 2,
             latency_us: 50,
             power_mw: 0,
-            entry: Entry::SystemIo(0x414),
+            entry: Entry::SystemIo(0),
         }],
         &SKYLAKE,
     );
     assert_eq!(admitted[0].enter, Enter::Halt);
     assert_eq!(refused[0].1, Refusal::IoPort);
+    // AMD Zen 5 System I/O C2/C3 (0x414/0x415) are admitted and do not wait on MWAIT.
+    let amd_cst = [
+        declared(1, 1, 2, 1, 0),
+        CState {
+            kind: 2,
+            latency_us: 18,
+            power_mw: 0,
+            entry: Entry::SystemIo(0x414),
+        },
+        CState {
+            kind: 3,
+            latency_us: 300,
+            power_mw: 0,
+            entry: Entry::SystemIo(0x415),
+        },
+    ];
+    // Without opt-in (`allow_io: false`), System I/O C2/C3 are refused.
+    let (default_admitted, default_refused) = admit(
+        &amd_cst,
+        &Cpu {
+            allow_io: false,
+            ..ZEN5
+        },
+    );
+    assert_eq!(default_admitted.len(), 1);
+    assert_eq!(
+        default_refused.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+        [Refusal::IoPort, Refusal::IoPort]
+    );
+    // With opt-in (`allow_io: true`), AMD Zen 5 System I/O C2/C3 (0x414/0x415) are admitted.
+    let (amd_admitted, amd_refused) = admit(&amd_cst, &ZEN5);
+    assert!(amd_refused.is_empty(), "{amd_refused:?}");
+    let amd_entered: Vec<_> = amd_admitted
+        .iter()
+        .map(|s| (s.kind, s.enter, s.residency_us))
+        .collect();
+    assert_eq!(
+        amd_entered,
+        [
+            (1, Enter::Mwait(0), 2),
+            (2, Enter::IoPort(0x414), 36),
+            (3, Enter::IoPort(0x415), 600),
+        ]
+    );
+    assert!(!waits_with_mwait(&amd_admitted));
+    assert_eq!(select(&amd_admitted, Some(100)).unwrap().kind, 2);
+    assert_eq!(select(&amd_admitted, Some(1000)).unwrap().kind, 3);
     assert_eq!(
         admit(&[declared(2, 101, 2, 3, 0x10)], &SKYLAKE).1[0].1,
         Refusal::Latency

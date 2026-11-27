@@ -548,6 +548,10 @@ fn call_for_work() {
         PUMPS.wakes_held.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    if may_move() && super::host_core::wake_if_sleeping() {
+        PUMPS.woken.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     if may_move() && call_idle_core() {
         PUMPS.woken.fetch_add(1, Ordering::Relaxed);
         return;

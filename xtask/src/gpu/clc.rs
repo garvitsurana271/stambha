@@ -142,10 +142,14 @@ fn programs(path: &Path, jobs: u16) -> Result<std::result::Result<Vec<PathBuf>, 
             fs::remove_dir_all(&build)?;
         }
         let _ = fs::remove_file(&record);
-        // The host's own pkg-config, which knows where its libraries are,
+        // The host's own pkgconf/pkg-config, which knows where its libraries are,
         // else the program the pkg-config wheel wraps: the wheel's launcher,
-        // first on `path`, loses its output to Meson.
-        let pkg_config = match crate::tools::which("pkg-config") {
+        // first on `path`, loses its output to Meson. Prefer `pkgconf` directly
+        // because Fedora's `/usr/bin/pkg-config` wrapper invokes `pkgconf` via
+        // `PATH` and would otherwise hit the wheel's launcher.
+        let pkg_config = match crate::tools::which("pkgconf")
+            .or_else(|| crate::tools::which("pkg-config"))
+        {
             Some(host) => super::support::slashed(&host),
             None => super::toolchain::pkg_config()?,
         };

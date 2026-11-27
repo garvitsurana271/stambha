@@ -234,6 +234,19 @@ fn root_bridges() -> Vec<(u16, core::ops::RangeInclusive<u8>)> {
 /// functions.
 const CENSUS_LINES: usize = 256;
 
+/// MediaTek PCI vendor ID and MT7925 device IDs (`mt7925e_device_table`).
+const MEDIATEK: u16 = 0x14c3;
+const MT7925_DEVICES: [u16; 2] = [0x7925, 0x0717];
+
+/// Whether the firmware PCI census saw an MT7925 Wi-Fi controller, which
+/// needs a larger 32-bit passthrough DMA pool below 4 GiB.
+static MT7925_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the PCI census observed an MT7925 (`14c3:7925` or `14c3:0717`).
+pub(crate) fn mt7925_present() -> bool {
+    MT7925_PRESENT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// One `HOST PCI` line for each function the firmware lists, with what the
 /// drivers will do with it, written while the firmware still stores the
 /// boot log: a later report that names only a PCI address then maps to a
@@ -242,6 +255,12 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
     static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         return;
+    }
+    if functions.iter().any(|function| {
+        let identity = function.identity();
+        identity.vendor == MEDIATEK && MT7925_DEVICES.contains(&identity.device)
+    }) {
+        MT7925_PRESENT.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     let displays: Vec<_> = functions
         .iter()

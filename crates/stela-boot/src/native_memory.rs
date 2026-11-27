@@ -62,12 +62,25 @@ static LOW_DMA_END: AtomicU64 = AtomicU64::new(0);
 /// passthrough domain.
 const LOW_DMA_PAGES: [usize; 3] = [4096, 2048, 1024];
 
+/// Larger low DMA pool requested only when the PCI census sees an MT7925
+/// (`14c3:7925` / `14c3:0717`): it installs 256 WM TX, 128 FWDL TX, 512
+/// event RX and 1536 data RX buffers as individual 4 KiB page-aligned
+/// allocations (~20 MiB in the heap before in-flight TX buffers and bring-up
+/// retries, exceeding 16 MiB), stepping down on tighter firmware maps.
+const MT7925_LOW_DMA_PAGES: [usize; 5] = [16384, 8192, 4096, 2048, 1024];
+
 /// Reserve the low DMA pool from the firmware, below 4 GiB, before boot
-/// services end. Without room the pool is absent and a 32-bit request the
-/// heap cannot meet fails as before.
-pub(crate) fn reserve_low_dma() -> crate::handoff::Region {
+/// services end. When `mt7925` is true, requests up to 64 MiB first and
+/// steps down; otherwise keeps the default 16 MiB ceiling. Without room the
+/// pool is absent and a 32-bit request the heap cannot meet fails as before.
+pub(crate) fn reserve_low_dma(mt7925: bool) -> crate::handoff::Region {
     use uefi::boot::{self, AllocateType, MemoryType};
-    for pages in LOW_DMA_PAGES {
+    let sizes: &[usize] = if mt7925 {
+        &MT7925_LOW_DMA_PAGES
+    } else {
+        &LOW_DMA_PAGES
+    };
+    for &pages in sizes {
         if let Ok(allocation) = boot::allocate_pages(
             AllocateType::MaxAddress(u32::MAX.into()),
             MemoryType::LOADER_DATA,

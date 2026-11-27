@@ -941,7 +941,7 @@ fn load(
 
     let remapping = crate::native_dma::firmware_units()?;
     let amd_tables = crate::native_dma::reserve_amd_tables(&remapping);
-    let low_dma = crate::native_memory::reserve_low_dma();
+    let low_dma = crate::native_memory::reserve_low_dma(crate::storage::mt7925_present());
 
     let mut native_mmio = crate::native_mmio::Prepared::capture().map_err(|error| {
         output::arguments(format_args!("NATIVE MMIO unavailable capture={error}\n"));

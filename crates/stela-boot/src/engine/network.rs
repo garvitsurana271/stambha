@@ -13,6 +13,7 @@
 //! adapter). Its registers and DMA pages are identity-mapped in the
 //! loader's root, so every frame moves inside that root
 //! (`storage::RestoreRoot`), as block and input I/O do.
+
 mod security;
 use super::storage::RestoreRoot;
 use crate::Refusal;
@@ -1019,6 +1020,18 @@ impl GuestNetwork {
 
     pub fn mac(&self) -> Mac {
         self.link.mac()
+    }
+
+    /// Whether the backing host adapter is a Wi-Fi device (rather than wired
+    /// Ethernet).
+    pub fn wireless(&self) -> bool {
+        self.link.device.wireless()
+    }
+
+    /// Whether previously dequeued outbound frames are still waiting to be
+    /// handed to the host adapter.
+    pub fn has_unsent(&self) -> bool {
+        !self.unsent.is_empty()
     }
 
     /// The host adapter's carrier, looked at once per [`CARRIER_MILLIS`],

@@ -360,6 +360,13 @@ impl AppleDevices {
         self.usb_network().is_ok_and(|network| network.has_room())
     }
 
+    /// Whether the guest's USB Ethernet adapter has an outbound frame waiting
+    /// to be sent to the host network; false without an adapter.
+    pub fn network_has_outbound(&mut self) -> bool {
+        self.usb_network()
+            .is_ok_and(|network| network.has_outbound())
+    }
+
     /// The next frame the guest sent through its USB Ethernet adapter.
     pub fn network_take(&mut self) -> Option<Vec<u8>> {
         self.usb_network().ok()?.take()

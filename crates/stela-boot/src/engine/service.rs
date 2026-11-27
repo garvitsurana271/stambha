@@ -112,6 +112,12 @@ const ANCHOR_SECONDS: u64 = 600;
 /// hold it for milliseconds, while that part ran recently.
 const DEFERRED_MILLIS: u64 = 20;
 
+/// Minimum interval between idle network polls on the host core when the
+/// previous turn saw no TX or RX frames and no partial burst: keeps Wi-Fi
+/// adapters from waking PCIe ASPM L1 on every 500 us turn and contending on
+/// the host drivers' lock while keeping full cadence during active traffic.
+const NETWORK_IDLE_MILLIS: u64 = 3;
+
 /// The parts a turn runs, in order: the inputs first, as a pointer's motion
 /// is what the guest's user waits on.
 const INPUTS: usize = 0;
@@ -142,6 +148,8 @@ pub(super) struct Service {
     next: usize,
     /// When each part last ran, for [`DEFERRED_MILLIS`].
     ran: [u64; TURN_PARTS],
+    /// Whether the last network turn moved no frames and left no cut burst.
+    network_idle: bool,
     #[cfg(feature = "diagnostics")]
     input_peak: Option<InputTurn>,
 }
@@ -186,6 +194,7 @@ impl Service {
             anchored: None,
             next: 0,
             ran: [now; TURN_PARTS],
+            network_idle: false,
             #[cfg(feature = "diagnostics")]
             input_peak: None,
         }
@@ -260,6 +269,7 @@ impl Service {
             anchored,
             next,
             ran,
+            network_idle,
             #[cfg(feature = "diagnostics")]
             input_peak,
         } = self;
@@ -285,6 +295,7 @@ impl Service {
         let deferred = millis * DEFERRED_MILLIS;
         let mut turn = Turn::new(from, now, step.then_some(limit));
         let guest = || watch.pending(host::fresh_counter()).is_some();
+        let network_idle_window = stamp.wrapping_sub(ran[NETWORK]) < NETWORK_IDLE_MILLIS * millis;
         // Whether `part` runs in this turn; `drivers` when it calls the host
         // drivers, whose lock another core may hold: such a part is left
         // to a later turn without ending this one.
@@ -377,7 +388,19 @@ impl Service {
             });
             lap.part_of(Part::Log, |_| drivers);
         }
-        if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, &mut turn)) {
+        let network_due = network.as_ref().is_some_and(|net| {
+            let idle_skip = !boot
+                && super::host_core::here()
+                && net.wireless()
+                && *network_idle
+                && !net.has_unsent()
+                && network_idle_window
+                && !devices
+                    .try_with(|devices| devices.network_has_outbound())
+                    .unwrap_or(true);
+            !idle_skip && due(NETWORK, true, &mut turn)
+        });
+        if let Some(network) = network.as_mut().filter(|_| network_due) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
             let mut split = Split::new(NETWORK_PIECES);
@@ -407,6 +430,7 @@ impl Service {
             let delivering = host::rdtsc();
             split.add(3, receiving, delivering);
             network_cut = budget.cut();
+            *network_idle = to_send == 0 && read == 0 && !network_cut;
             // Served, as a received frame is: a carrier change is a
             // notification the guest's controller must pick up.
             devices.serve(|devices| {

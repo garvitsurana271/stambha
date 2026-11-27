@@ -466,6 +466,11 @@ impl Ecm {
         self.state.inbound.len() < self.state.queue_frames()
     }
 
+    /// Whether the guest has at least one outbound frame queued to send.
+    pub fn has_outbound(&self) -> bool {
+        !self.state.outbound.is_empty()
+    }
+
     /// The next frame the guest sent, for the host network.
     pub fn take(&mut self) -> Option<Vec<u8>> {
         self.state.outbound.pop_front()

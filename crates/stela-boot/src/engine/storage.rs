@@ -1779,6 +1779,9 @@ pub struct Selection<'a> {
     pub preboot: Option<&'a Target>,
     /// The translation store, by its GUID; left out when it cannot open.
     pub store: Option<Guid>,
+    /// With `--store-esp`, admit the translation and pipeline store on an EFI
+    /// system partition (`Named::Host`); off by default (`Named::Unique`).
+    pub store_esp: bool,
     /// The USB's boot log, by its GUID; left out when it cannot open.
     pub log: Option<Guid>,
     /// Required host-owned durable FDR file volume, when explicitly staged.
@@ -1827,6 +1830,7 @@ pub unsafe fn open(
         medium,
         preboot,
         store,
+        store_esp,
         log,
         fdr,
         usb_disks,
@@ -2203,7 +2207,10 @@ pub unsafe fn open(
         .collect();
     let required = named.len();
     let mut optional: Vec<(Named, Optional)> = store
-        .map(|guid| (Named::Unique(guid), Optional::Store))
+        // By default `Optional::Store` uses `Named::Unique` so an internal ESP
+        // shared with another OS is not written unasked; `--store-esp` opts
+        // into `Named::Host`, like `log` and `fdr`.
+        .map(|guid| (Named::store(guid, store_esp), Optional::Store))
         .into_iter()
         .chain(log.map(|guid| (Named::Host(guid), Optional::Log)))
         .collect();

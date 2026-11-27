@@ -167,6 +167,19 @@ pub enum Named {
     Host(Guid),
 }
 
+impl Named {
+    /// How the translation and pipeline store partition is named: [`Self::Unique`]
+    /// by default (refusing an EFI system partition), or [`Self::Host`] when
+    /// `--store-esp` explicitly opts into opening the store on an ESP.
+    pub fn store(guid: Guid, allow_esp: bool) -> Self {
+        if allow_esp {
+            Self::Host(guid)
+        } else {
+            Self::Unique(guid)
+        }
+    }
+}
+
 /// Open every partition of `named`, each disk taken once and shared by the
 /// partitions found on it: the Mac's internal SSD, the install medium and
 /// the translation store `stela.efi` rewrites are partitions of one USB, and
@@ -893,6 +906,19 @@ mod tests {
             Some((0, StorageError::SystemPartition(esp)))
         );
         let opened = open_shared(&mut devices, &[Named::Host(esp)]).unwrap();
+        assert_eq!((opened.len(), devices.len()), (1, 1));
+    }
+
+    #[test]
+    fn the_store_opens_on_an_esp_only_with_store_esp() {
+        let esp: Guid = "AAAAAAAA-0000-0000-0000-000000000001".parse().unwrap();
+        let mut devices = disks();
+        devices.remove(0);
+        assert_eq!(
+            open_shared(&mut devices, &[Named::store(esp, false)]).err(),
+            Some((0, StorageError::SystemPartition(esp)))
+        );
+        let opened = open_shared(&mut devices, &[Named::store(esp, true)]).unwrap();
         assert_eq!((opened.len(), devices.len()), (1, 1));
     }
 

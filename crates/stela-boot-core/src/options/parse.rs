@@ -86,6 +86,7 @@ impl ParseState<'_> {
                     return Err(Error::DuplicatePackPreload);
                 }
             }
+            STORE_ESP => options.store_esp = true,
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

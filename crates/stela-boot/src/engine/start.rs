@@ -3477,6 +3477,7 @@ fn start_devices(
             let captures = handoff.storage.captures;
             let mmio = *native_mmio;
             let medium_partition = options.install_source;
+            let store_esp = options.store_esp;
             let log_partition = handoff.log_partition.map(Guid);
             let usb4_approved = options.usb4_approved.clone();
             let boot_disk = handoff.boot_disk().map(alloc::string::String::from);
@@ -3510,6 +3511,7 @@ fn start_devices(
                             medium: medium_partition,
                             preboot: owned_preboot.as_ref(),
                             store: translation_store,
+                            store_esp,
                             log: log_partition,
                             fdr: fdr_partition,
                             usb_disks: &owned_usb,

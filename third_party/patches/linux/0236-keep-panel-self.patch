@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: G-Nug85 <85583980+G-Nug85@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 09:12:13 +0000
+Subject: [PATCH] fix(amdgpu): keep Panel Self Refresh and Panel Replay off
+ under Stela, whose own flip pacing reads vblank sequences a self-refreshing
+ panel stops, where a Cezanne laptop's eDP flickered
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 14b539d50efa14a3ceb4924807214d39af2bc255..ad38a7e65bc0368fb871198062c222b51bff472d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -218,7 +218,14 @@ int amdgpu_smu_pptable_id = -1;
+  * EDP NO POWER SEQUENCING (bit 4) disabled by default
+  */
+ uint amdgpu_dc_feature_mask = 2;
+-uint amdgpu_dc_debug_mask;
++/*
++ * Stela: no Panel Self Refresh or Panel Replay. Stela shows the guest's
++ * frames by page flips it paces itself and reads vblank sequences to do it;
++ * a panel in self refresh turns its controller's vblank interrupt off, so
++ * those reads fail and the flips stall. On a ThinkPad T14 Gen 2 (Cezanne,
++ * eDP) macOS's setup flickered and its vblank reference counts warned.
++ */
++uint amdgpu_dc_debug_mask = DC_DISABLE_PSR | DC_DISABLE_REPLAY;
+ uint amdgpu_dc_visual_confirm;
+ int amdgpu_async_gfx_ring = 1;
+ int amdgpu_mcbp = -1;

@@ -64,20 +64,29 @@
 //! which J473's has not; it reads 0, open, for any other reader.
 //!
 //! Notifications (event-name table at 0x12d79b8, indexed by subclass):
-//! `pow.ExternalPowerChange` (0x7101) when the AC adapter comes or goes,
-//! and `pow.BatteryStateChange` (0x7102) only when the battery turns
-//! critical, the one occasion Asahi saw it from real SMC firmware; status
-//! and percentage changes send nothing, and macOS's battery driver polls
-//! them (`pollBatteryState`). Their data bytes are those Asahi saw
-//! (`0x710101xx`, with the AC adapter's new state as `xx`, and
-//! `0x71020000`; inferred: no 26B123 reader of either was
-//! traced, and no `AppleSmartBattery` object registers a 0x71 callback by
-//! name). Each kind goes out at most once a
-//! [`SPACING_MILLIS`] apart, a change in between waiting for the spacing to
-//! end, and only once the AP has enabled notifications, as every other: a
-//! change before that only moves the values, which the AP reads when it
-//! starts. While the SoC sleeps a change waits for it to wake.
-use super::{Key, READABLE, WRITABLE, code, event};
+//! `AppleSmartBattery::smcNotifierHandler` registers `AppleSmartBattery::
+//! messageSMC` (0x2e6e610) on `smcPowerStateNotifySymbol` (`pow`, class 0x71).
+//! `messageSMC` (0x2e6e94c..0x2e6e9a8) triggers a full poll
+//! (`pollBatteryState(2)`) on subclass 1 (`pow.ExternalPowerChange`, 0x7101)
+//! and a user-visible poll (`pollBatteryState(4)`) on subclass 2
+//! (`pow.BatteryStateChange`, 0x7102). `AppleSmartBattery` has no periodic
+//! polling timer, so 0x7101 goes out when the AC adapter comes or goes and
+//! 0x7102 goes out when percentage, charging status or the critical flag
+//! changes. Their data bytes are those Asahi saw (`0x710101xx`, with the AC
+//! adapter's new state as `xx`, and `0x71020000`). Each kind goes out at most
+//! once a [`SPACING_MILLIS`] apart, a change in between waiting for the
+//! spacing to end, and only once the AP has enabled notifications, as every
+//! other: a change before that only moves the values, which the AP reads when
+//! it starts. While the SoC sleeps a change waits for it to wake.
+//!
+//! Endianness: `AppleSmartBattery::_smcReadKey` (0x2e653a0) calls
+//! `AppleSMCFamily::smcReadKeyHostEndian` (vtable +0x890, 0x2dcfe20), which
+//! reverses any 2..=8-byte value unless `keyAttributes` bit 2
+//! ([`LITTLE_ENDIAN`], 0x04) is set (0x2dcfed0..0x2dcff10). Every 2..=8-byte
+//! battery key here is stored little-endian and carries [`LITTLE_ENDIAN`];
+//! without it `BPCC` (`[0x00, 0x01]`) is swapped to `0x0001` (0 packs, 1
+//! charger), hiding the battery from macOS and pinning `ExternalConnected` on.
+use super::{Key, LITTLE_ENDIAN, READABLE, WRITABLE, code, event};
 use alloc::{vec, vec::Vec};
 use stela_drivers::platform::power_snapshot::{BatteryState, PowerSnapshot, Status, Summary};
 
@@ -168,10 +177,23 @@ pub(super) const ASLEEP_RETRY_MILLIS: u64 = 1_000;
 
 /// The battery's keys, with `snapshot`'s values.
 pub(super) fn keys(snapshot: &PowerSnapshot) -> Vec<(u32, Key)> {
-    let fixed = |kind: &[u8; 4], value: Vec<u8>| Key {
-        kind: code(kind),
-        flags: READABLE,
-        value,
+    // `AppleSMCFamily::smcReadKeyHostEndian` swaps 2..=8-byte values unless
+    // `LITTLE_ENDIAN` (bit 2) is set in `keyAttributes`. Every multi-byte
+    // integer key here is stored little-endian, so mark 2..=8-byte values.
+    let endian = |bytes: usize| {
+        if (2..=8).contains(&bytes) {
+            LITTLE_ENDIAN
+        } else {
+            0
+        }
+    };
+    let fixed = |kind: &[u8; 4], value: Vec<u8>| {
+        let flags = READABLE | endian(value.len());
+        Key {
+            kind: code(kind),
+            flags,
+            value,
+        }
     };
     let mut keys: Vec<(u32, Key)> = READINGS
         .iter()
@@ -180,11 +202,12 @@ pub(super) fn keys(snapshot: &PowerSnapshot) -> Vec<(u32, Key)> {
         .collect();
     keys.push((PACK_COUNT, fixed(b"ui16", PACKS.to_le_bytes().to_vec())));
     keys.push((LID_CLOSED, fixed(b"ui8 ", vec![0])));
-    keys.extend(
-        LATCHES
-            .iter()
-            .map(|&(name, kind, bytes)| (code(name), Key::new(kind, READABLE | WRITABLE, bytes))),
-    );
+    keys.extend(LATCHES.iter().map(|&(name, kind, bytes)| {
+        (
+            code(name),
+            Key::new(kind, READABLE | WRITABLE | endian(bytes), bytes),
+        )
+    }));
     keys
 }
 
@@ -325,8 +348,14 @@ impl Battery {
         };
         let summary = self.shown.summary();
         let measured = self.measured;
-        self.pending[EXTERNAL_POWER] |= summary.ac_online != measured.ac_online;
-        self.pending[BATTERY_STATE] |= summary.critical && !measured.critical;
+        let ac_changed = summary.ac_online != measured.ac_online;
+        self.pending[EXTERNAL_POWER] |= ac_changed;
+        // `0x7101` already triggers a full poll (`pollBatteryState(2)`), so
+        // send `0x7102` (`pollBatteryState(4)`) when turning critical or when
+        // percent/status changes without an AC transition.
+        self.pending[BATTERY_STATE] |= (summary.critical && !measured.critical)
+            || (!ac_changed
+                && (summary.percent != measured.percent || summary.status != measured.status));
         self.measured = summary;
         READINGS
             .iter()

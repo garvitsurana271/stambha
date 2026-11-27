@@ -15,22 +15,22 @@ const MAC_MINI_KEYS: u32 = 26;
 const TABLE: [(&[u8; 4], &[u8; 4], u8, u8); 33] = [
     (b"AC-N", b"ui8 ", 1, READABLE),
     (b"AC-W", b"ui8 ", 1, READABLE),
-    (b"B0AC", b"si16", 2, READABLE),
-    (b"B0AV", b"ui16", 2, READABLE),
-    (b"B0CM", b"ui16", 2, READABLE),
-    (b"B0CT", b"ui16", 2, READABLE),
-    (b"B0DC", b"ui16", 2, READABLE),
-    (b"B0FC", b"ui16", 2, READABLE),
-    (b"B0IV", b"si16", 2, READABLE),
-    (b"B0RM", b"ui16", 2, READABLE),
-    (b"B0TE", b"ui16", 2, READABLE),
-    (b"B0TF", b"ui16", 2, READABLE),
-    (b"B0UC", b"ui16", 2, READABLE),
+    (b"B0AC", b"si16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0AV", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0CM", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0CT", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0DC", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0FC", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0IV", b"si16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0RM", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0TE", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0TF", b"ui16", 2, READABLE | LITTLE_ENDIAN),
+    (b"B0UC", b"ui16", 2, READABLE | LITTLE_ENDIAN),
     (b"BCF0", b"flag", 1, READABLE),
-    (b"BDFU", b"ui64", 8, READABLE | WRITABLE),
+    (b"BDFU", b"ui64", 8, READABLE | WRITABLE | LITTLE_ENDIAN),
     (b"BMDN", b"ch8*", 32, READABLE),
     (b"BMSN", b"ch8*", 32, READABLE),
-    (b"BPCC", b"ui16", 2, READABLE),
+    (b"BPCC", b"ui16", 2, READABLE | LITTLE_ENDIAN),
     (b"BSCL", b"ui8 ", 1, READABLE | WRITABLE),
     (b"BSFC", b"flag", 1, READABLE),
     (b"BUIC", b"ui8 ", 1, READABLE),
@@ -39,13 +39,13 @@ const TABLE: [(&[u8; 4], &[u8; 4], u8, u8); 33] = [
     (b"CHCC", b"ui8 ", 1, READABLE),
     (b"CHCE", b"flag", 1, READABLE),
     (b"CHSC", b"ui8 ", 1, READABLE),
-    (b"CHTE", b"ui32", 4, READABLE | WRITABLE),
+    (b"CHTE", b"ui32", 4, READABLE | WRITABLE | LITTLE_ENDIAN),
     (b"D0IG", b"ui8 ", 1, READABLE | WRITABLE),
     (b"MSLD", b"ui8 ", 1, READABLE),
     (b"UB0C", b"ui8 ", 1, READABLE | WRITABLE),
-    (b"UB0T", b"ui64", 8, READABLE | WRITABLE),
-    (b"WAFC", b"ui32", 4, READABLE | WRITABLE),
-    (b"bfD0", b"ui32", 4, READABLE | WRITABLE),
+    (b"UB0T", b"ui64", 8, READABLE | WRITABLE | LITTLE_ENDIAN),
+    (b"WAFC", b"ui32", 4, READABLE | WRITABLE | LITTLE_ENDIAN),
+    (b"bfD0", b"ui32", 4, READABLE | WRITABLE | LITTLE_ENDIAN),
 ];
 
 fn request(kind: u8, id: u8, size: u8, write_size: u8, key: u32) -> u64 {
@@ -245,6 +245,11 @@ fn battery_keys_declare_the_types_and_sizes_macos_decodes() {
 #[test]
 fn bpcc_reports_one_pack_and_no_charger_as_the_battery_driver_decodes_it() {
     let (mut smc, sram) = with_battery();
+    // `AppleSmartBattery::_smcReadKey` uses `smcReadKeyHostEndian`, which
+    // swaps 2-byte keys unless `LITTLE_ENDIAN` (bit 2) is set in attributes.
+    let info = send(&mut smc, request(KEY_INFO, 0, 0, 0, code(b"BPCC")));
+    assert_eq!(info as u8, SUCCESS);
+    assert_ne!(sram.get(6)[5] & LITTLE_ENDIAN, 0);
     let value = read(&mut smc, &sram, b"BPCC");
     assert_eq!(value, [0x00, 0x01]);
     // `smcNotifierHandler`: LDRH, then the high byte is the pack count.
@@ -739,34 +744,42 @@ fn ac_changes_and_a_battery_turning_critical_notify_once_enabled_and_no_closer_t
     assert!(notifications(&mut smc).is_empty());
     assert_eq!(smc.power_due(60_000), None);
 
-    // Unplugged: the AC change alone; the battery's new status is no
-    // notification, macOS polls it.
+    // Unplugged: AC change (0x7101) triggers a full poll; no redundant 0x7102.
     assert_eq!(smc.power(&on_battery(), 10_000), None);
     assert_eq!(notifications(&mut smc), [EXTERNAL_POWER]);
-    // Nor are voltage, current, time or a percent step.
+    // Voltage, current and time drift alone send nothing.
     let drift = PowerSnapshot {
         battery: Some(BatteryState {
             voltage_mv: Some(15_700),
             current_ma: Some(-2_700),
             time_to_empty_min: Some(80),
-            percent: Some(72),
             ..discharging()
         }),
         ..on_battery()
     };
     assert_eq!(smc.power(&drift, 10_100), None);
     assert!(notifications(&mut smc).is_empty());
+    // A percent step sends 0x7102 immediately (first battery-state notice).
+    let step = PowerSnapshot {
+        battery: Some(BatteryState {
+            percent: Some(72),
+            ..discharging()
+        }),
+        ..on_battery()
+    };
+    assert_eq!(smc.power(&step, 10_200), None);
     assert_eq!(read(&mut smc, &sram, b"BUIC"), [72]);
-    // Turning critical is.
-    assert_eq!(smc.power(&critical(true), 20_000), None);
+    assert_eq!(notifications(&mut smc), [BATTERY_STATE]);
+    // Turning critical sends 0x7102 once spaced past 10_200 + 5 s.
+    assert_eq!(smc.power(&critical(true), 25_000), None);
     assert_eq!(notifications(&mut smc), [BATTERY_STATE]);
     // Staying critical, or no longer critical, is not.
-    assert_eq!(smc.power(&critical(true), 21_000), None);
-    assert_eq!(smc.power(&critical(false), 22_000), None);
+    assert_eq!(smc.power(&critical(true), 26_000), None);
+    assert_eq!(smc.power(&critical(false), 27_000), None);
     assert!(notifications(&mut smc).is_empty());
     // Critical again 3 s after the last notice waits for its 5 s spacing.
-    let spaced = 20_000 + SPACING_MILLIS[1];
-    assert_eq!(smc.power(&critical(true), 23_000), Some(spaced));
+    let spaced = 25_000 + SPACING_MILLIS[1];
+    assert_eq!(smc.power(&critical(true), 28_000), Some(spaced));
     assert_eq!(smc.power_due(spaced - 1), Some(spaced));
     assert!(notifications(&mut smc).is_empty());
     assert_eq!(smc.power_due(spaced), None);

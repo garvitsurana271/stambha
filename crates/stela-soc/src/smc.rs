@@ -266,6 +266,10 @@ const AP_PANIC: u8 = 0x8a;
 pub const READABLE: u8 = 0x80;
 pub const WRITABLE: u8 = 0x40;
 pub const FUNCTION: u8 = 0x10;
+/// `SMCKeyInfoData.keyAttributes` bit 2: the key's multi-byte value is stored
+/// little-endian, so `AppleSMCFamily::smcReadKeyHostEndian` (26B123 file
+/// 0x2dcfe20) and `smcWriteKeyHostEndian` (0x2dd0038) do not byte-swap it.
+pub const LITTLE_ENDIAN: u8 = 0x04;
 const MAX_VALUE: usize = 120;
 const WRITE_LOG_LIMIT: usize = 64;
 

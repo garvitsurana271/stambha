@@ -1201,17 +1201,27 @@ pub struct HeapLayout {
 }
 
 impl HeapLayout {
+    /// Bound the per-array descriptor counts so drivers reporting huge virtual
+    /// descriptor heaps (such as Intel ANV) do not allocate multi-GiB host
+    /// descriptor pools in `vkCreateDescriptorPool`, while still exceeding
+    /// Metal Tier 2's 500,000 image and 2,048 sampler requirements.
+    pub const MAX_IMAGE_DESCRIPTORS: u32 = 1 << 20;
+    pub const MAX_SAMPLER_DESCRIPTORS: u32 = 4096;
+
     pub fn new(limits: &Limits) -> Self {
         let sampled = limits
             .max_descriptor_set_update_after_bind_sampled_images
-            .min(limits.max_per_stage_update_after_bind_sampled_images);
+            .min(limits.max_per_stage_update_after_bind_sampled_images)
+            .min(Self::MAX_IMAGE_DESCRIPTORS);
         let storage = limits
             .max_descriptor_set_update_after_bind_storage_images
-            .min(limits.max_per_stage_update_after_bind_storage_images);
+            .min(limits.max_per_stage_update_after_bind_storage_images)
+            .min(Self::MAX_IMAGE_DESCRIPTORS);
         let samplers = limits
             .max_descriptor_set_update_after_bind_samplers
             .min(limits.max_per_stage_update_after_bind_samplers)
-            .min(limits.max_sampler_allocation_count);
+            .min(limits.max_sampler_allocation_count)
+            .min(Self::MAX_SAMPLER_DESCRIPTORS);
         // Storage indices leave the high half's flag and level count bits free.
         let storage = storage.min(ResourceId::MAX_STORAGE);
         Self {
@@ -2589,5 +2599,19 @@ mod tests {
         assert_eq!(heap.allocate(HeapArray::Samplers), Ok(1));
         assert_eq!(heap.in_use(HeapArray::Samplers), 1);
         assert_eq!(heap.in_use(HeapArray::SampledImages), 0);
+    }
+
+    #[test]
+    fn huge_descriptor_limits_are_capped() {
+        let mut limits = nvk(&CHIPS[0], 8 << 30).limits;
+        limits.max_descriptor_set_update_after_bind_sampled_images = 67_108_864;
+        limits.max_per_stage_update_after_bind_sampled_images = 67_108_864;
+        limits.max_descriptor_set_update_after_bind_storage_images = 67_108_864;
+        limits.max_per_stage_update_after_bind_storage_images = 67_108_864;
+        limits.max_descriptor_set_update_after_bind_samplers = 65_536;
+        limits.max_per_stage_update_after_bind_samplers = 65_536;
+        limits.max_sampler_allocation_count = 65_536;
+        let layout = HeapLayout::new(&limits);
+        assert_eq!(layout.counts, [786_432, 786_432, 4_096, 262_144, 262_144]);
     }
 }

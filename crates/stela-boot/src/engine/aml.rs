@@ -2316,6 +2316,23 @@ impl HostAcpi {
         if !BRIGHTNESS_KEYS.load(Ordering::Acquire) {
             return;
         }
+        #[cfg(feature = "nvk")]
+        if super::gpu::display::has_drm_backlight() {
+            let mut event = 0u32;
+            for slot in &BRIGHTNESS {
+                let pending = slot.swap(0, Ordering::AcqRel);
+                if pending != 0 {
+                    event = pending;
+                }
+            }
+            if event == 0 {
+                event = seen;
+            }
+            if event != 0 {
+                super::gpu::display::request_brightness(event);
+            }
+            return;
+        }
         let mut taken = false;
         for (index, (control, _)) in self.backlights.borrow_mut().iter_mut().enumerate() {
             let event = BRIGHTNESS[index].swap(0, Ordering::AcqRel);

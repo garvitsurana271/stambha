@@ -27,7 +27,7 @@ use crate::engine::host;
 use crate::{Result, output};
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
 use stela_contracts::refuse;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
@@ -110,6 +110,9 @@ struct KmsScanout {
     /// The outputs' power as the guest's display sleep and the lid's
     /// request ask ([`Self::follow_lid`]).
     panel: stela_boot_core::lid_panel::PanelPower,
+    /// Last brightness level applied to the Linux `BACKLIGHT_RAW` device,
+    /// so rapid keypresses step smoothly even during a DPCD AUX ramp.
+    last_backlight: Option<u32>,
 }
 
 impl Scanout for KmsScanout {
@@ -229,7 +232,9 @@ impl Scanout for KmsScanout {
     fn queued(&self) -> bool {
         let looking = self.display.is_some() || !self.waiting.is_empty();
         let lid = self.display.is_some() && crate::engine::lid::dark() != self.panel.request();
-        lid || (looking && host::rdtsc() >= self.next_look)
+        let brightness = BRIGHTNESS_EVENT.load(Ordering::Acquire) != 0;
+        lid || brightness
+            || (looking && host::rdtsc() >= self.next_look)
             || self
                 .display
                 .as_ref()
@@ -244,6 +249,7 @@ impl Scanout for KmsScanout {
             finish_present(display, flushed)?;
         }
         self.follow_lid();
+        self.follow_brightness();
         self.look();
         Ok(())
     }
@@ -321,6 +327,48 @@ impl KmsScanout {
             )),
         }
     }
+    /// Apply a pending brightness-key notification from [`crate::engine::aml`]
+    /// to the GPU's native Linux `BACKLIGHT_RAW` device (e.g. `amdgpu_bl0` on
+    /// eDP OLED panels), outside ACPI's lock on the boot CPU.
+    fn follow_brightness(&mut self) {
+        use stela_boot_core::panel_backlight;
+        let event = BRIGHTNESS_EVENT.swap(0, Ordering::AcqRel);
+        if event == 0 {
+            return;
+        }
+        let what = match event {
+            panel_backlight::NOTIFY_INC => "up",
+            panel_backlight::NOTIFY_DEC => "down",
+            panel_backlight::NOTIFY_CYCLE => "cycled",
+            panel_backlight::NOTIFY_ZERO => "to zero",
+            _ => "off",
+        };
+        let (hw_current, max) = match client::backlight_info() {
+            Ok((current, max)) if max > 0 => (current, max),
+            Ok(_) => return,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "GPU panel backlight: brightness {what} query refused ({error})\n"
+                ));
+                return;
+            }
+        };
+        let from = self.last_backlight.unwrap_or(hw_current).min(max);
+        let to = panel_backlight::step(from, max, event);
+        match client::backlight_set(to) {
+            Ok(()) => {
+                self.last_backlight = Some(to);
+                output::arguments(format_args!(
+                    "GPU panel backlight: brightness {what} {from} -> {to} of {max}\n"
+                ));
+            }
+            Err(error) => output::arguments(format_args!(
+                "GPU panel backlight: brightness {what} {from} -> {to} of {max} refused \
+                 ({error})\n"
+            )),
+        }
+    }
+
     fn new(
         mode: ScanoutMode,
         refresh_millihertz: u32,
@@ -344,6 +392,7 @@ impl KmsScanout {
             vblank_tsc: None,
             composition: composition::Composition::default(),
             panel: stela_boot_core::lid_panel::PanelPower::new(),
+            last_backlight: None,
         }
     }
 
@@ -526,10 +575,31 @@ fn report_listings(name: &str, display: &mut Display<Node>) {
 /// Whether a display taken shows on a laptop's built-in panel, whose
 /// backlight is set apart from the picture ([`panel_shown`]).
 static PANEL: AtomicBool = AtomicBool::new(false);
+/// Whether the GPU's Linux driver registered a `BACKLIGHT_RAW` device (e.g.
+/// `amdgpu_bl0`), which brightness keys then drive directly instead of `_BCM`.
+static DRM_BACKLIGHT: AtomicBool = AtomicBool::new(false);
+/// Pending ACPI brightness-key notification (`NOTIFY_INC`/`NOTIFY_DEC`/etc.)
+/// relayed lock-free from [`crate::engine::aml`] to [`KmsScanout::flush`].
+static BRIGHTNESS_EVENT: AtomicU32 = AtomicU32::new(0);
 
 /// Whether a GPU's display shows on a built-in panel (eDP, LVDS or DSI).
 pub(in crate::engine) fn panel_shown() -> bool {
     PANEL.load(Ordering::Relaxed)
+}
+
+/// Record whether the GPU registered a native Linux `BACKLIGHT_RAW` device.
+pub(super) fn set_drm_backlight(present: bool) {
+    DRM_BACKLIGHT.store(present, Ordering::Release);
+}
+
+/// Whether brightness keys should drive the GPU's Linux `BACKLIGHT_RAW` device.
+pub(in crate::engine) fn has_drm_backlight() -> bool {
+    DRM_BACKLIGHT.load(Ordering::Acquire)
+}
+
+/// Queue a brightness-key notification for [`KmsScanout::flush`].
+pub(in crate::engine) fn request_brightness(event: u32) {
+    BRIGHTNESS_EVENT.store(event, Ordering::Release);
 }
 
 /// The connectors `display` shows on, the one that paces it first, which

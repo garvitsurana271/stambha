@@ -306,6 +306,17 @@ enum Operation {
     Export(*const client::Run, usize),
     /// Stop the GPUs as a power-off does.
     Shutdown,
+    /// Query `(current, max)` from the first Linux `BACKLIGHT_RAW` device.
+    BacklightInfo(*mut BacklightInfo),
+    /// Set the first Linux `BACKLIGHT_RAW` device to a raw brightness level.
+    BacklightSet(u32),
+}
+
+/// Output of [`Operation::BacklightInfo`].
+#[derive(Clone, Copy, Default)]
+struct BacklightInfo {
+    current: u32,
+    max: u32,
 }
 
 /// What Mesa's threads run on: their calls go to Linux, off this stack. Linux's
@@ -679,8 +690,37 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 }
                 0
             }
+            Operation::BacklightInfo(out) => match stela_drivers::gpu::drm::backlight_info() {
+                Ok((current, max)) => {
+                    out.write(BacklightInfo { current, max });
+                    0
+                }
+                Err(errno) => i64::from(errno),
+            },
+            Operation::BacklightSet(level) => match stela_drivers::gpu::drm::backlight_set(level) {
+                Ok(()) => 0,
+                Err(errno) => i64::from(errno),
+            },
         }
     }
+}
+
+/// Reads `(current, max)` brightness from the first registered Linux
+/// `BACKLIGHT_RAW` device (e.g. `amdgpu_bl0`), running on a Linux task.
+pub(super) fn backlight_info() -> Result<(u32, u32), i64> {
+    let mut info = BacklightInfo::default();
+    let rc = submit(Operation::BacklightInfo(&mut info));
+    if rc == 0 {
+        Ok((info.current, info.max))
+    } else {
+        Err(rc)
+    }
+}
+
+/// Sets the first registered Linux `BACKLIGHT_RAW` device to `level`.
+pub(super) fn backlight_set(level: u32) -> Result<(), i64> {
+    let rc = submit(Operation::BacklightSet(level));
+    if rc == 0 { Ok(()) } else { Err(rc) }
 }
 
 /// Maps `size` bytes of `fd` at `offset` in the window, for the address or a
@@ -1066,6 +1106,8 @@ fn request_code(operation: &Operation) -> u32 {
         Operation::Export(..) => HostCall::Export,
         Operation::Shutdown => HostCall::Shutdown,
         Operation::Seek(..) => HostCall::Seek,
+        Operation::BacklightInfo(_) => HostCall::BacklightInfo,
+        Operation::BacklightSet(_) => HostCall::BacklightSet,
     };
     call.code()
 }

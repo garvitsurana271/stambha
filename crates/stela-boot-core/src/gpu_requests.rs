@@ -20,10 +20,12 @@ pub enum HostCall {
     Export = 10,
     Shutdown = 11,
     Seek = 12,
+    BacklightInfo = 13,
+    BacklightSet = 14,
 }
 
 impl HostCall {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 14] = [
         Self::Open,
         Self::Close,
         Self::Duplicate,
@@ -36,6 +38,8 @@ impl HostCall {
         Self::Export,
         Self::Shutdown,
         Self::Seek,
+        Self::BacklightInfo,
+        Self::BacklightSet,
     ];
 
     pub const fn code(self) -> u32 {
@@ -56,6 +60,8 @@ impl HostCall {
             Self::Export => "export",
             Self::Shutdown => "shutdown",
             Self::Seek => "seek",
+            Self::BacklightInfo => "backlight-info",
+            Self::BacklightSet => "backlight-set",
         }
     }
 }

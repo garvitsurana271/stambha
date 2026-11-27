@@ -3928,6 +3928,31 @@ pub(super) fn panel_brightness(
         if !display::panel_shown() {
             return;
         }
+        // Prefer the GPU driver's own `BACKLIGHT_RAW` device (e.g. `amdgpu_bl0`
+        // for eDP DPCD AUX OLED panels where ACPI `_BCM` is a no-op).
+        if let Ok((current, max)) = client::backlight_info()
+            && max > 0
+        {
+            display::set_drm_backlight(true);
+            if current == 0 {
+                match client::backlight_set(max) {
+                    Ok(()) => output::arguments(format_args!(
+                        "DISPLAY panel backlight (DRM): raised 0 -> {max} of {max}; brightness \
+                         keys drive it directly\n"
+                    )),
+                    Err(error) => output::arguments(format_args!(
+                        "DISPLAY panel backlight (DRM): current 0 of {max}, raise refused \
+                         ({error})\n"
+                    )),
+                }
+            } else {
+                output::arguments(format_args!(
+                    "DISPLAY panel backlight (DRM): current {current} of {max}; brightness keys \
+                     drive it directly\n"
+                ));
+            }
+            return;
+        }
         let Some(acpi) = acpi else {
             output::arguments(format_args!(
                 "DISPLAY built-in panel: no ACPI namespace, so its brightness stays as it is\n"

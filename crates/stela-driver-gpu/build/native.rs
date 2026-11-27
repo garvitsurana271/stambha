@@ -418,10 +418,17 @@ impl Linux {
             build.objects(descriptors);
             build.objects(captured.iter().skip(shared_count).map(Captured::object));
         }
+        let mut drm_kernel = kernel.clone();
+        #[cfg(feature = "linux-drm")]
+        {
+            let backlight_control = PathBuf::from("src/compat/linux/drm/backlight_control.c");
+            println!("cargo:rerun-if-changed={}", backlight_control.display());
+            drm_kernel.push(backlight_control);
+        }
         let _class_archive = linux_archive(
             &build,
             "stela-linux-drm",
-            &kernel,
+            &drm_kernel,
             &upstream,
             Path::new(COMPAT),
         );

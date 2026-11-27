@@ -166,13 +166,18 @@ int atexit(void (*function)(void))
  * layouts Stela's Metal device requires, an image a copy fills and a shader
  * then samples read back blank with DCC on (app icons and widgets drew
  * empty on an RX 6800 XT).
- * ANV halves KMD-reported system RAM <= 4 GiB assuming it shares memory with
- * a general Linux host; under Stambha totalram_pages() is already the GPU's
- * dedicated RAM share (2560M on a 16 GiB host), so give ANV 100% of it. */
+ * For the same reason, ANV runs with CCS color compression off (noccs):
+ * compressed aux surfaces under unified image layouts cause corrupted UI
+ * widgets and Gen12 GPU hangs (`context reset due to GPU hang`).
+ * ANV also halves KMD-reported system RAM <= 4 GiB assuming it shares memory
+ * with a general Linux host; under Stambha totalram_pages() is already the
+ * GPU's dedicated RAM share (2560M on a 16 GiB host), so give ANV 100%. */
 char *getenv(const char *name)
 {
 	if (name && !strcmp(name, "RADV_DEBUG"))
 		return (char *)"nodcc";
+	if (name && !strcmp(name, "INTEL_DEBUG"))
+		return (char *)"noccs";
 	if (name && !strcmp(name, "ANV_SYS_MEM_LIMIT"))
 		return (char *)"100";
 	return NULL;

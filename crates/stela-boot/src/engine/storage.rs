@@ -26,13 +26,14 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 use stela_boot_core::drivers_turn::{self, Call, Entry};
+use stela_boot_core::host_locks::{Domain, HostLocks};
 use stela_boot_core::staged_disk::{self, DiskWorker};
 use stela_contracts::refuse;
 use stela_drivers::{
     Handoff, PlatformCaptures,
     block::{
         BlockDevice, BlockError, CallbackStats, Command, Direction, Finished, Identity, Shared,
-        Window,
+        Transport, Window,
     },
     bus::dma::RegionAllocator,
     bus::pci::Address,
@@ -116,8 +117,53 @@ impl Drop for TaggedRoots {
     }
 }
 
-/// Held while a core is inside the host drivers ([`RestoreRoot`]).
+/// Held while a core is inside the shared host drivers domain ([`RestoreRoot`]).
 static HOST_DRIVERS: AtomicBool = AtomicBool::new(false);
+
+/// Independent lock domain for PCIe NVMe storage controllers whose steady
+/// I/O touches only their own queues and registers.
+pub(super) const DOMAIN_NVME: Domain = Domain::Controller(0);
+/// Independent lock domain for PCIe network controllers (wired NICs and PCIe
+/// Wi-Fi adapters) whose steady I/O touches only their own rings and registers;
+/// USB network adapters share xHCI and stay on [`Domain::Shared`].
+pub(super) const DOMAIN_NET: Domain = Domain::Controller(1);
+
+/// Per-domain lock table enforcing lock order across [`Domain::Shared`]
+/// (slot 0) and independent controller domains ([`DOMAIN_NVME`] = slot 1,
+/// [`DOMAIN_NET`] = slot 2). [`HOST_DRIVERS`] stays mirrored with slot 0 so
+/// existing contention counters and lock-free `host_drivers_taken()` checks
+/// keep working while [`HostLocks`] enforces lock order for `Shared` too.
+static CONTROLLER_LOCKS: HostLocks<3> = HostLocks::new();
+
+/// Where the current holder of each controller domain took its lock, for the
+/// report of a wait that overran (indexed by `Controller(i)` -> `i`).
+static CONTROLLER_SITES: [AtomicPtr<Location<'static>>; 2] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; 2];
+
+fn lock_owner() -> u64 {
+    let gs = super::host::activated_base();
+    if gs != 0 {
+        gs
+    } else {
+        let gs = this_gs();
+        if gs != 0 { gs } else { 1 }
+    }
+}
+
+fn controller_slot(domain: Domain) -> usize {
+    match domain {
+        Domain::Controller(index) => usize::from(index),
+        Domain::Shared => unreachable!("controller_slot called for Domain::Shared"),
+    }
+}
+
+/// Whether `domain` is currently held by any core.
+pub(super) fn domain_taken(domain: Domain) -> bool {
+    match domain {
+        Domain::Shared => host_drivers_taken(),
+        Domain::Controller(_) => CONTROLLER_LOCKS.taken(domain),
+    }
+}
 
 /// The parts of a host disk call timed for [`HostDisks::report`].
 #[derive(Clone, Copy)]
@@ -188,12 +234,16 @@ pub(super) fn entered_loader_root(owner: &crate::paging::loader::LoaderTables) -
 /// Whether this processor is inside the host drivers: a fault stopped it
 /// there, as no driver calls back into Stela's output.
 pub(super) fn host_drivers_held_here() -> bool {
-    if !HOST_DRIVERS.load(Ordering::Acquire) {
+    let shared = HOST_DRIVERS.load(Ordering::Acquire);
+    let controller = CONTROLLER_LOCKS.taken(DOMAIN_NVME) || CONTROLLER_LOCKS.taken(DOMAIN_NET);
+    if !shared && !controller {
         return false;
     }
     // SAFETY: CPL0 read of this processor's own GS base.
     let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
-    gs != 0 && HOST_DRIVERS_GS.load(Ordering::Acquire) == gs
+    gs != 0
+        && ((shared && HOST_DRIVERS_GS.load(Ordering::Acquire) == gs)
+            || (controller && CONTROLLER_LOCKS.held_by(gs).controller.is_some()))
 }
 /// Whether this activated processor holds the host drivers' lock, which
 /// every Linux entry holds on whichever processor it runs: one load while
@@ -213,7 +263,8 @@ pub(super) fn with_drivers_held<T>(read: impl FnOnce() -> T) -> Option<T> {
     if holds_host_drivers() {
         return Some(read());
     }
-    if !try_lock_host_drivers() {
+    let owner = lock_owner();
+    if !try_lock_host_drivers_for(owner) {
         return None;
     }
     let flags: u64;
@@ -223,6 +274,7 @@ pub(super) fn with_drivers_held<T>(read: impl FnOnce() -> T) -> Option<T> {
     let result = read();
     HOST_DRIVERS_GS.store(0, Ordering::Release);
     HOST_DRIVERS.store(false, Ordering::Release);
+    CONTROLLER_LOCKS.unlock(Domain::Shared, owner);
     // SAFETY: the save above, on this processor.
     unsafe { asm!("push {}", "popfq", in(reg) flags) };
     Some(result)
@@ -341,10 +393,14 @@ pub(super) fn store_usb_log_in_gpu_start() -> bool {
 /// and the longest wait.
 static HOST_DRIVERS_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-fn try_lock_host_drivers() -> bool {
-    HOST_DRIVERS
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_ok()
+fn try_lock_host_drivers_for(owner: u64) -> bool {
+    match CONTROLLER_LOCKS.try_lock(Domain::Shared, owner) {
+        Ok(true) => {
+            HOST_DRIVERS.store(true, Ordering::Release);
+            true
+        }
+        Ok(false) | Err(_) => false,
+    }
 }
 
 /// Cores spinning for [`HOST_DRIVERS`] now ([`host_drivers_wanted`]).
@@ -368,14 +424,10 @@ const HOST_DRIVERS_WAIT_SECONDS: u64 = 90;
 
 /// Spin for the host drivers' lock for `limit` counter ticks at most,
 /// counted as a waiter meanwhile ([`host_drivers_wanted`]).
-fn spin_for_host_drivers(limit: u64) -> stela_boot_core::bounded_spin::Spin {
+fn spin_for_host_drivers(owner: u64, limit: u64) -> stela_boot_core::bounded_spin::Spin {
     HOST_DRIVERS_WAITERS.fetch_add(1, Ordering::Relaxed);
     let spun = stela_boot_core::bounded_spin::spin(
-        || {
-            HOST_DRIVERS
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        },
+        || try_lock_host_drivers_for(owner),
         super::host::rdtsc,
         limit,
         || {
@@ -398,16 +450,22 @@ fn count_host_drivers_wait(waited: u64) {
 /// Take the host drivers' lock, counting the wait. A wait past
 /// [`HOST_DRIVERS_WAIT_SECONDS`] stops the mount with a report naming the
 /// holder instead of spinning forever.
-fn lock_host_drivers() -> u64 {
-    if try_lock_host_drivers() {
-        return 0;
+fn lock_host_drivers() -> (u64, u64) {
+    let owner = lock_owner();
+    match CONTROLLER_LOCKS.try_lock(Domain::Shared, owner) {
+        Ok(true) => {
+            HOST_DRIVERS.store(true, Ordering::Release);
+            return (owner, 0);
+        }
+        Ok(false) => {}
+        Err(error) => panic!("host driver lock order: {error:?}"),
     }
     // An unknown rate is taken as a fast one, so the bound only grows.
     let hz = match crate::firmware::tsc_hz() {
         0 => 10_000_000_000,
         hz => hz,
     };
-    let waited = match spin_for_host_drivers(hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS)) {
+    let waited = match spin_for_host_drivers(owner, hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS)) {
         stela_boot_core::bounded_spin::Spin::Taken(waited) => waited,
         stela_boot_core::bounded_spin::Spin::Overrun(waited) => {
             let site = HOST_DRIVERS_SITE.load(Ordering::Relaxed);
@@ -423,7 +481,44 @@ fn lock_host_drivers() -> u64 {
         }
     };
     count_host_drivers_wait(waited);
-    waited
+    (owner, waited)
+}
+
+/// Take a controller domain's lock with the same bounded timeout and fatal
+/// holder report as [`lock_host_drivers`].
+fn lock_controller(domain: Domain) -> (u64, u64) {
+    let owner = lock_owner();
+    match CONTROLLER_LOCKS.try_lock(domain, owner) {
+        Ok(true) => return (owner, 0),
+        Ok(false) => {}
+        Err(error) => panic!("host driver lock order ({domain:?}): {error:?}"),
+    }
+    let hz = match crate::firmware::tsc_hz() {
+        0 => 10_000_000_000,
+        hz => hz,
+    };
+    let waited = match stela_boot_core::bounded_spin::spin(
+        || CONTROLLER_LOCKS.try_lock(domain, owner) == Ok(true),
+        super::host::rdtsc,
+        hz.saturating_mul(HOST_DRIVERS_WAIT_SECONDS),
+        || {
+            crate::native_mmio::shootdown::service();
+            core::hint::spin_loop();
+        },
+    ) {
+        stela_boot_core::bounded_spin::Spin::Taken(waited) => waited,
+        stela_boot_core::bounded_spin::Spin::Overrun(waited) => {
+            let site = CONTROLLER_SITES[controller_slot(domain)].load(Ordering::Relaxed);
+            // SAFETY: only `enter_locked` stores, a `&'static Location`.
+            let site = unsafe { site.as_ref() };
+            output::fatal(format_args!(
+                "host controller lock {domain:?} not released after {} ms: held from {}",
+                u128::from(waited) * 1000 / u128::from(hz),
+                site.map_or_else(|| String::from("unknown"), |site| format!("{site}")),
+            ))
+        }
+    };
+    (owner, waited)
 }
 
 /// The longest hold of [`HOST_DRIVERS`] since the last report, in TSC
@@ -452,18 +547,20 @@ pub(super) fn host_drivers_waited(
 }
 
 /// Inside the host drivers: the loader's root, with interrupts masked and
-/// the host drivers' lock held, until dropped.
+/// the domain's lock held, until dropped.
 pub(super) struct RestoreRoot {
     root: u64,
     flags: u64,
     tagged: bool,
+    domain: Domain,
+    owner: u64,
     /// When this core took the lock, and where.
     entered: u64,
     site: &'static Location<'static>,
     _local: core::marker::PhantomData<*mut ()>,
 }
 impl RestoreRoot {
-    /// Wait for the host drivers' lock, which no holder takes again: a
+    /// Wait for the shared host drivers' lock, which no holder takes again: a
     /// driver never calls back into the engine's host interfaces.
     ///
     /// # Safety
@@ -471,32 +568,53 @@ impl RestoreRoot {
     /// processor's pinned local record is active.
     #[track_caller]
     pub(super) unsafe fn enter(root: u64) -> Self {
-        let waited = lock_host_drivers();
+        // SAFETY: forwarded to `enter_domain` with `Domain::Shared`.
+        unsafe { Self::enter_domain(root, Domain::Shared) }
+    }
+
+    /// Wait for `domain`'s lock and switch to the loader root.
+    ///
+    /// # Safety
+    /// As for [`Self::enter`]; callers passing [`Domain::Controller`] must
+    /// only touch that controller's own registers/rings and never re-enter
+    /// [`Domain::Shared`] or another controller.
+    #[track_caller]
+    pub(super) unsafe fn enter_domain(root: u64, domain: Domain) -> Self {
+        let (owner, waited) = match domain {
+            Domain::Shared => lock_host_drivers(),
+            Domain::Controller(_) => lock_controller(domain),
+        };
         record(DiskPart::Wait, waited);
-        // SAFETY: the caller supplies the live root, and this core holds the lock.
-        unsafe { Self::enter_locked(root) }
+        // SAFETY: the caller supplies the live root, and this core holds `domain`.
+        unsafe { Self::enter_locked(root, domain, owner) }
     }
 
     /// Enter for a service turn's work that was put off for long: wait for
     /// the lock for `micros` at most, as a waiter a holder that works in
     /// steps lets in at its next step ([`host_drivers_wanted`]). `None`
-    /// when the holder kept it; an unknown counter rate waits for nothing.
+    /// when the holder kept it or lock order forbids taking it; an unknown
+    /// counter rate waits for nothing.
     ///
     /// # Safety
     /// As for [`Self::enter`].
     #[track_caller]
     pub(super) unsafe fn enter_within(root: u64, micros: u64) -> Option<Self> {
-        if !try_lock_host_drivers() {
-            let limit = crate::firmware::tsc_hz() / 1_000_000 * micros;
-            match spin_for_host_drivers(limit) {
-                stela_boot_core::bounded_spin::Spin::Taken(waited) => {
-                    count_host_drivers_wait(waited);
+        let owner = lock_owner();
+        match CONTROLLER_LOCKS.try_lock(Domain::Shared, owner) {
+            Ok(true) => HOST_DRIVERS.store(true, Ordering::Release),
+            Ok(false) => {
+                let limit = crate::firmware::tsc_hz() / 1_000_000 * micros;
+                match spin_for_host_drivers(owner, limit) {
+                    stela_boot_core::bounded_spin::Spin::Taken(waited) => {
+                        count_host_drivers_wait(waited);
+                    }
+                    stela_boot_core::bounded_spin::Spin::Overrun(_) => return None,
                 }
-                stela_boot_core::bounded_spin::Spin::Overrun(_) => return None,
             }
+            Err(_) => return None,
         }
         // SAFETY: the caller supplies the live root, and this core holds the lock.
-        Some(unsafe { Self::enter_locked(root) })
+        Some(unsafe { Self::enter_locked(root, Domain::Shared, owner) })
     }
 
     /// Enter for work that can wait until another service turn.
@@ -505,34 +623,55 @@ impl RestoreRoot {
     /// As for [`Self::enter`].
     #[track_caller]
     pub(super) unsafe fn try_enter(root: u64) -> Option<Self> {
-        if !try_lock_host_drivers() {
+        // SAFETY: forwarded to `try_enter_domain` with `Domain::Shared`.
+        unsafe { Self::try_enter_domain(root, Domain::Shared) }
+    }
+
+    /// Try to enter `domain` without spinning; returns `None` if `domain` is
+    /// held by another core or if taking it here would violate lock order.
+    ///
+    /// # Safety
+    /// As for [`Self::enter_domain`].
+    #[track_caller]
+    pub(super) unsafe fn try_enter_domain(root: u64, domain: Domain) -> Option<Self> {
+        let owner = lock_owner();
+        let taken = match domain {
+            Domain::Shared => try_lock_host_drivers_for(owner),
+            Domain::Controller(_) => matches!(CONTROLLER_LOCKS.try_lock(domain, owner), Ok(true)),
+        };
+        if !taken {
             // The holder may need this processor to acknowledge a shootdown.
             crate::native_mmio::shootdown::service();
             return None;
         }
-        // SAFETY: the caller supplies the live root, and this core holds the lock.
-        Some(unsafe { Self::enter_locked(root) })
+        // SAFETY: the caller supplies the live root, and this core holds `domain`.
+        Some(unsafe { Self::enter_locked(root, domain, owner) })
     }
 
     /// # Safety
-    /// The caller holds the host drivers' lock and meets [`Self::enter`]'s
+    /// The caller holds `domain`'s lock and meets [`Self::enter`]'s
     /// requirements.
     #[track_caller]
-    unsafe fn enter_locked(root: u64) -> Self {
+    unsafe fn enter_locked(root: u64, domain: Domain, owner: u64) -> Self {
         let (previous, flags): (u64, u64);
         // SAFETY: CPL0 control register read; interrupts remain off until
         // the original root has been restored.
         unsafe {
             asm!("pushfq","pop {flags}","cli","mov {previous}, cr3",flags=out(reg)flags,previous=out(reg)previous);
         }
-        // SAFETY: native CPU; this records the same concrete manager
-        // owner while IF0 excludes its own IRQ/reentrant root transition.
-        let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
-        HOST_DRIVERS_GS.store(gs, Ordering::Release);
-        HOST_DRIVERS_SITE.store(
-            ptr::from_ref(Location::caller()).cast_mut(),
-            Ordering::Relaxed,
-        );
+        let caller = ptr::from_ref(Location::caller()).cast_mut();
+        match domain {
+            Domain::Shared => {
+                // SAFETY: native CPU; this records the same concrete manager
+                // owner while IF0 excludes its own IRQ/reentrant root transition.
+                let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
+                HOST_DRIVERS_GS.store(gs, Ordering::Release);
+                HOST_DRIVERS_SITE.store(caller, Ordering::Relaxed);
+            }
+            Domain::Controller(_) => {
+                CONTROLLER_SITES[controller_slot(domain)].store(caller, Ordering::Relaxed);
+            }
+        }
         // A context or the host's state says so without a read of CR4, which
         // a hypervisor may intercept: disks are polled here thousands of times
         // a second.
@@ -561,6 +700,8 @@ impl RestoreRoot {
             root: previous,
             flags,
             tagged,
+            domain,
+            owner,
             entered,
             site: Location::caller(),
             _local: core::marker::PhantomData,
@@ -581,12 +722,21 @@ impl Drop for RestoreRoot {
         unsafe {
             asm!("mov cr3, {}",in(reg)root,options(nostack,preserves_flags));
         }
-        HOST_DRIVERS_GS.store(0, Ordering::Release);
-        let held = super::host::rdtsc().wrapping_sub(self.entered);
-        if HOST_DRIVERS_HELD.fetch_max(held, Ordering::Relaxed) < held {
-            HOST_DRIVERS_HOLDER.store(ptr::from_ref(self.site).cast_mut(), Ordering::Relaxed);
+        match self.domain {
+            Domain::Shared => {
+                HOST_DRIVERS_GS.store(0, Ordering::Release);
+                let held = super::host::rdtsc().wrapping_sub(self.entered);
+                if HOST_DRIVERS_HELD.fetch_max(held, Ordering::Relaxed) < held {
+                    HOST_DRIVERS_HOLDER
+                        .store(ptr::from_ref(self.site).cast_mut(), Ordering::Relaxed);
+                }
+                HOST_DRIVERS.store(false, Ordering::Release);
+                CONTROLLER_LOCKS.unlock(Domain::Shared, self.owner);
+            }
+            Domain::Controller(_) => {
+                CONTROLLER_LOCKS.unlock(self.domain, self.owner);
+            }
         }
-        HOST_DRIVERS.store(false, Ordering::Release);
         // A disk step given up while this core held the lock is due now.
         if !super::host::in_interrupt() && OWED.ring_due() {
             ring_owed();
@@ -662,6 +812,7 @@ pub(crate) unsafe fn with_driver_root<T>(root: u64, operation: impl FnOnce() -> 
 struct Service {
     inner: Box<dyn BlockDevice>,
     root: u64,
+    domain: Domain,
     /// Commands started and not yet finished. With none no completion can be
     /// posted, and a look at the disk need not change roots, which without
     /// PCIDs flushes this core's TLB.
@@ -681,6 +832,14 @@ struct Service {
     /// The commands started and not finished, by tag, to name one whose
     /// finish held its processor ([`HELD`]).
     started: Vec<(u32, staged_disk::CommandName)>,
+}
+
+fn disk_domain(device: &dyn BlockDevice) -> Domain {
+    if device.identity().transport == Transport::Nvme {
+        DOMAIN_NVME
+    } else {
+        Domain::Shared
+    }
 }
 
 /// The longest host disk call over 50 ms since the last report, which
@@ -801,7 +960,7 @@ impl Service {
             Entry::Try => {
                 // SAFETY: open() captured the loader root, as for every
                 // service call.
-                let root = unsafe { RestoreRoot::try_enter(self.root) };
+                let root = unsafe { RestoreRoot::try_enter_domain(self.root, self.domain) };
                 if root.is_none() {
                     TURN_PUT_OFF.fetch_add(1, Ordering::Relaxed);
                 }
@@ -810,7 +969,7 @@ impl Service {
             Entry::Wait => {
                 let started = turn.then(super::host::rdtsc);
                 // SAFETY: as above.
-                let root = unsafe { RestoreRoot::enter(self.root) };
+                let root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
                 if let Some(started) = started {
                     TURN_WAITED.fetch_add(root.entered.wrapping_sub(started), Ordering::Relaxed);
                 }
@@ -867,7 +1026,7 @@ impl BlockDevice for Service {
         let since = super::host::fresh_counter();
         let read = {
             // SAFETY: open() captured the loader root; callers supply window RAM.
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
             self.inner.read(lba, buffer)
         };
         let name = staged_disk::CommandName::waited("read", lba, self.blocks(buffer.len()));
@@ -879,7 +1038,7 @@ impl BlockDevice for Service {
         let since = super::host::fresh_counter();
         let written = {
             // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
             self.inner.write(lba, data)
         };
         let name = staged_disk::CommandName::waited("write", lba, self.blocks(data.len()));
@@ -891,7 +1050,7 @@ impl BlockDevice for Service {
         let since = super::host::fresh_counter();
         let flushed = {
             // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
             self.inner.flush_cache()
         };
         let name = staged_disk::CommandName::waited("flush", 0, 0);
@@ -903,7 +1062,7 @@ impl BlockDevice for Service {
         let since = super::host::fresh_counter();
         let written = {
             // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
             self.inner.write_fua(lba, data)
         };
         let name = staged_disk::CommandName::waited("write_fua", lba, self.blocks(data.len()));
@@ -915,7 +1074,7 @@ impl BlockDevice for Service {
         let since = super::host::fresh_counter();
         let discarded = {
             // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
             self.inner.discard(lba, blocks)
         };
         let name = staged_disk::CommandName::waited("discard", lba, blocks);
@@ -927,7 +1086,7 @@ impl BlockDevice for Service {
         let since = super::host::fresh_counter();
         let zeroed = {
             // SAFETY: as in read().
-            let _root = unsafe { RestoreRoot::enter(self.root) };
+            let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
             self.inner.write_zeroes(lba, blocks, unmap)
         };
         let name = staged_disk::CommandName::waited("write_zeroes", lba, blocks);
@@ -939,7 +1098,7 @@ impl BlockDevice for Service {
         self.inner.depth()
     }
     fn room(&self) -> bool {
-        drivers_turn::room(turn_here(), host_drivers_taken(), self.inner.room())
+        drivers_turn::room(turn_here(), domain_taken(self.domain), self.inner.room())
     }
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
         self.start_with(command, false)
@@ -1172,9 +1331,11 @@ impl stela_drivers::probe::Observer for Observer {
         devices
             .disks
             .push(Box::new(partition.device().shared().whole()));
+        let domain = disk_domain(&partition);
         let log = HeldLog(Service {
             inner: Box::new(partition),
             root: self.root,
+            domain,
             running: 0,
             signals: Cell::new(None),
             looked: Cell::new(staged_disk::LookGate::default()),
@@ -1223,6 +1384,16 @@ impl stela_drivers::probe::Observer for Observer {
 
 /// The host sides of the guest's staged disks ([`stage`]).
 static STAGED: [AtomicPtr<DiskWorker>; 4] = [const { AtomicPtr::new(ptr::null_mut()) }; 4];
+/// Whether every staged disk uses [`DOMAIN_NVME`] rather than [`Domain::Shared`].
+static STAGED_ALL_NVME: AtomicBool = AtomicBool::new(true);
+
+fn staged_domain_taken() -> bool {
+    if STAGED_ALL_NVME.load(Ordering::Acquire) {
+        domain_taken(DOMAIN_NVME)
+    } else {
+        domain_taken(DOMAIN_NVME) || host_drivers_taken()
+    }
+}
 /// A device call left a staged disk work: the processor that holds the
 /// devices' lock, the only one that can have set it, steps the disk as it
 /// releases the lock ([`released`]).
@@ -1342,10 +1513,10 @@ fn ring_owed() {
 /// a step would wait for it there, and the work keeps for the next, which
 /// that core's release rings for.
 fn step(worker: &DiskWorker) -> Option<staged_disk::Step> {
-    if host_drivers_taken() {
+    if staged_domain_taken() {
         OWED.owe(super::host::fresh_counter());
         // A holder that let go before the debt was recorded rings for none.
-        if host_drivers_taken() {
+        if staged_domain_taken() {
             STEPS[1].fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -1389,6 +1560,9 @@ pub(super) fn try_stage(
             stela_contracts::masked::Tail(&device.identity().serial)
         ));
         return Err(device);
+    }
+    if device.identity().transport != Transport::Nvme {
+        STAGED_ALL_NVME.store(false, Ordering::Release);
     }
     let (disk, worker) = staged_disk::stage(device, wake_staged);
     let worker: *mut DiskWorker = Box::leak(Box::new(worker));
@@ -1440,7 +1614,7 @@ pub(super) fn serve_staged(whole: bool) -> bool {
             let progressed = step.is_some_and(|step| step.progressed());
             if !progressed
                 && !(super::host::fresh_counter().wrapping_sub(started) < budget
-                    && !host_drivers_taken()
+                    && !staged_domain_taken()
                     && worker.posted())
             {
                 break;
@@ -1463,7 +1637,7 @@ pub(super) fn signalled() -> bool {
         SEEN_DOORBELLS.load(Ordering::Relaxed),
         OWED.owed(),
         staged_workers().any(DiskWorker::work),
-        host_drivers_taken(),
+        staged_domain_taken(),
     )
 }
 
@@ -1491,7 +1665,7 @@ pub(super) fn signal_due() -> bool {
     HANDED_SIGNALS.take(
         super::host::doorbells(),
         SEEN_DOORBELLS.load(Ordering::Relaxed),
-        host_drivers_taken(),
+        staged_domain_taken(),
     )
 }
 
@@ -1938,9 +2112,11 @@ pub unsafe fn open(
             super::ident::Kind::Disk,
             &format!("{:?}", partition.disk().transport),
         );
+        let domain = disk_domain(&partition);
         Box::new(Service {
             inner: Box::new(partition),
             root,
+            domain,
             running: 0,
             signals: Cell::new(None),
             looked: Cell::new(staged_disk::LookGate::default()),
@@ -2359,9 +2535,11 @@ pub unsafe fn open(
                 disk.identity().read_only,
                 disk.identity().features.rotation
             ));
+            let domain = disk_domain(&disk);
             Box::new(Service {
                 inner: Box::new(disk),
                 root,
+                domain,
                 running: 0,
                 signals: Cell::new(None),
                 looked: Cell::new(staged_disk::LookGate::default()),

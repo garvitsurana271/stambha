@@ -14,7 +14,7 @@
 //! loader's root, so every frame moves inside that root
 //! (`storage::RestoreRoot`), as block and input I/O do.
 mod security;
-use super::storage::RestoreRoot;
+use super::storage::{DOMAIN_NET, RestoreRoot};
 use crate::Refusal;
 use crate::Result;
 use crate::output;
@@ -23,6 +23,7 @@ use core::{
     cell::{Cell, RefCell},
     mem::ManuallyDrop,
 };
+use stela_boot_core::host_locks::Domain;
 use stela_boot_core::network_link;
 use stela_contracts::refuse;
 use stela_drivers::{
@@ -105,6 +106,7 @@ struct RootLink {
     /// Dropped only in the loader's root ([`in_loader_root`]).
     device: ManuallyDrop<Adapter>,
     root: u64,
+    domain: Domain,
     frames: Rc<Frames>,
     /// The configured Wi-Fi network's name for a Wi-Fi adapter, empty for a
     /// wired one: hidden in what the link says ([`Self::hidden`]).
@@ -134,9 +136,15 @@ impl RootLink {
             true => ssid.unwrap_or_default().as_bytes().to_vec(),
             false => Vec::new(),
         };
+        let domain = if device.is_usb() {
+            Domain::Shared
+        } else {
+            DOMAIN_NET
+        };
         Self {
             device: ManuallyDrop::new(device),
             root,
+            domain,
             frames: Rc::default(),
             ssid,
         }
@@ -197,26 +205,25 @@ impl RootLink {
     }
 
     /// [`Link::transmit`] for a service turn, which does not wait for the
-    /// host drivers' lock: `None` while another processor is inside them.
+    /// controller's lock: `None` while another processor holds it.
     fn transmit_now(&mut self, frame: &[u8]) -> Option<Result<(), LinkError>> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        let _root = unsafe { RestoreRoot::try_enter_domain(self.root, self.domain) }?;
         Some(self.send(frame))
     }
 
     /// [`Link::carrier`] for a service turn, as [`Self::transmit_now`].
     fn carrier_now(&mut self) -> Option<bool> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        let _root = unsafe { RestoreRoot::try_enter_domain(self.root, self.domain) }?;
         Some(self.device.carrier())
     }
 
     /// The adapter's own state line (`Link::diagnostic`) for a service
-    /// turn, as [`Self::transmit_now`]: `None` while another processor is
-    /// inside the host drivers.
+    /// turn, as [`Self::transmit_now`]: `None` while another processor holds it.
     fn diagnostic_now(&mut self) -> Option<Option<String>> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        let _root = unsafe { RestoreRoot::try_enter_domain(self.root, self.domain) }?;
         let state = self.device.diagnostic();
         Some(self.state(state))
     }
@@ -225,14 +232,14 @@ impl RootLink {
     /// turn, as [`Self::transmit_now`].
     fn join_now(&mut self) -> Option<Option<stela_drivers::net::Join>> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        let _root = unsafe { RestoreRoot::try_enter_domain(self.root, self.domain) }?;
         Some(self.device.take_join())
     }
 
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
     fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        let _root = unsafe { RestoreRoot::try_enter_domain(self.root, self.domain) }?;
         Some(self.arrived())
     }
 }
@@ -252,22 +259,22 @@ impl Link for RootLink {
     fn carrier(&mut self) -> bool {
         // SAFETY: the loader root `storage::open` captured maps this
         // device.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
         self.device.carrier()
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
         self.send(frame)
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
         self.arrived()
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
         self.device
             .receive_reusing(frame)
             .inspect(|&received| {
@@ -282,13 +289,13 @@ impl Link for RootLink {
     }
     fn diagnostic(&mut self) -> Option<String> {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
         let state = self.device.diagnostic();
         self.state(state)
     }
     fn retarget(&mut self, message: stela_drivers::bus::irq::MsiMessage) -> bool {
         // SAFETY: as in `carrier`.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
+        let _root = unsafe { RestoreRoot::enter_domain(self.root, self.domain) };
         self.device.retarget(message)
     }
     fn carrier_wait_us(&self) -> u64 {
@@ -1063,6 +1070,13 @@ impl GuestNetwork {
             output::arguments(format_args!("{}", record.line()));
         }
         Some(carrier)
+    }
+
+    /// Whether this guest network adapter shares the global host drivers'
+    /// lock (USB adapters over xHCI) rather than owning an independent PCIe
+    /// controller domain.
+    pub fn uses_shared_lock(&self) -> bool {
+        self.link.domain == Domain::Shared
     }
 
     /// Report the guest's link state as `status` gives it.

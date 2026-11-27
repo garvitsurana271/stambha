@@ -438,6 +438,12 @@ impl Adapter {
         }
     }
 
+    /// Whether the adapter runs over a shared USB host controller rather than
+    /// owning its own PCIe MMIO/DMA rings.
+    pub fn is_usb(&self) -> bool {
+        matches!(self, Self::Usb(_) | Self::UsbVendor(_))
+    }
+
     /// Where the adapter is, for logs.
     pub fn location(&self) -> &str {
         match self {

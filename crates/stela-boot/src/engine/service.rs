@@ -377,7 +377,10 @@ impl Service {
             });
             lap.part_of(Part::Log, |_| drivers);
         }
-        if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, &mut turn)) {
+        let network_due = network
+            .as_ref()
+            .is_some_and(|net| due(NETWORK, net.uses_shared_lock(), &mut turn));
+        if let Some(network) = network.as_mut().filter(|_| network_due) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
             let mut split = Split::new(NETWORK_PIECES);

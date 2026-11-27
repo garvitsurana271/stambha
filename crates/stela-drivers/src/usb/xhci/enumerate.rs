@@ -579,6 +579,9 @@ impl Controller {
     /// [`Self::enumerate`], recording how long each root port took. The
     /// ports are powered together, debounced together and empty ones skipped
     /// at once; only connected ports are reset and enumerated, one at a time.
+    /// A port that shows a connection does not wait out the connect settle
+    /// time of those that show none: they are debounced again once the
+    /// connected ones are enumerated, which spends that time.
     pub fn enumerate_timed(
         &mut self,
         dma: &mut dyn DmaAllocator,
@@ -587,49 +590,61 @@ impl Controller {
     ) -> Vec<Device> {
         let mut devices = Vec::new();
         let location = |c: &Self, port: u8| format!("{} port {port}", c.location);
-        let settled = match self.debounce_roots() {
-            Ok(settled) => settled,
-            Err(error) => {
-                failures.push((format!("{} root ports", self.location), error));
-                return devices;
+        let mut ports: Vec<u8> = (1..=self.max_ports).collect();
+        for settle in [false, true] {
+            if ports.is_empty() {
+                break;
             }
-        };
-        for (index, settled) in settled.into_iter().enumerate() {
-            let port = index as u8 + 1;
-            let (connected, debounce_us) = match settled {
+            let settled = match self.debounce_roots(&ports, settle) {
                 Ok(settled) => settled,
                 Err(error) => {
-                    failures.push((format!("{} debounce", location(self, port)), error));
-                    continue;
+                    failures.push((format!("{} root ports", self.location), error));
+                    return devices;
                 }
             };
-            let mut probe = PortProbe {
-                port,
-                connected,
-                debounce_us,
-                reset_us: 0,
-                enumerate_us: 0,
-            };
-            if connected {
-                let location = location(self, port);
-                crate::working(&location);
-                let clock = self.clock;
-                let start = clock.now_us();
-                let done = self.connect(
-                    location,
-                    None,
-                    Reset::Root(port),
-                    dma,
-                    &mut devices,
-                    failures,
-                );
-                probe.reset_us = done.reset_us;
-                probe.enumerate_us = clock
-                    .now_us()
-                    .saturating_sub(start)
-                    .saturating_sub(done.reset_us);
+            let mut quiet = Vec::new();
+            for (port, settled) in ports.into_iter().zip(settled) {
+                let (connected, debounce_us) = match settled {
+                    // Empty at its first sample: the settle time decides.
+                    Ok((false, 0)) if !settle => {
+                        quiet.push(port);
+                        continue;
+                    }
+                    Ok(settled) => settled,
+                    Err(error) => {
+                        failures.push((format!("{} debounce", location(self, port)), error));
+                        continue;
+                    }
+                };
+                let mut probe = PortProbe {
+                    port,
+                    connected,
+                    debounce_us,
+                    reset_us: 0,
+                    enumerate_us: 0,
+                };
+                if connected {
+                    let location = location(self, port);
+                    crate::working(&location);
+                    let clock = self.clock;
+                    let start = clock.now_us();
+                    let done = self.connect(
+                        location,
+                        None,
+                        Reset::Root(port),
+                        dma,
+                        &mut devices,
+                        failures,
+                    );
+                    probe.reset_us = done.reset_us;
+                    probe.enumerate_us = clock
+                        .now_us()
+                        .saturating_sub(start)
+                        .saturating_sub(done.reset_us);
+                }
+                probes.push(probe);
             }
-            probes.push(probe);
+            ports = quiet;
         }
         devices
     }
@@ -656,10 +671,11 @@ impl Controller {
         Ok(())
     }
 
-    /// Power the root ports ([`Self::power_roots`]), then debounce every
-    /// port together. What is left of the connect settle time since the
-    /// ports were powered is waited here, once for them all.
-    fn debounce_roots(&mut self) -> Result<Vec<Debounced>, BlockError> {
+    /// Power the root ports ([`Self::power_roots`]), then debounce `ports`
+    /// together. With `settle`, what is left of the connect settle time
+    /// since the ports were powered is waited here, once for them all;
+    /// without, a port empty at its first sample is empty at once.
+    fn debounce_roots(&mut self, ports: &[u8], settle: bool) -> Result<Vec<Debounced>, BlockError> {
         self.power_roots()?;
         let waited = self
             .clock
@@ -668,9 +684,9 @@ impl Controller {
         let minimum = self.minimum.clone();
         minimum.check()?;
         let settled = debounce_ports_with_delay(
-            usize::from(self.max_ports),
-            settle_left(waited),
-            |index| Ok(self.sample_root(index as u8 + 1)),
+            ports.len(),
+            if settle { settle_left(waited) } else { 0 },
+            |index| Ok(self.sample_root(ports[index])),
             || minimum.wait_us(DEBOUNCE_STEP_US),
         );
         self.minimum_status(Ok(settled))

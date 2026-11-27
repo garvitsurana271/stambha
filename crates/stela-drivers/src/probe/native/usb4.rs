@@ -527,6 +527,14 @@ pub(in crate::probe) unsafe fn bring_up(
         }
     }
     let attached = &mut devices.usb4_hosts;
+    // No domain to come up, so no quiet to wait for: a PC whose USB4 hosts
+    // all failed to attach spent QUIET_MS here before its first device.
+    let managed = attached
+        .iter()
+        .any(|host| matches!(host.connection(), Connection::Software { .. }));
+    if !managed {
+        return hosts;
+    }
     let Ok(start) = clock.try_now_us() else {
         return hosts;
     };

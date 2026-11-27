@@ -616,7 +616,7 @@ pub(crate) struct Settings {
     #[arg(long, hide = true)]
     remove_install: Option<String>,
     /// Seconds `stela.efi`'s startup choices wait (0: only when a key is
-    /// held), or `auto`.
+    /// held or pressed right away), or `auto`.
     #[arg(long, value_name = "SECONDS|auto", value_parser = wait, hide = true)]
     chooser_timeout: Option<Wait>,
     /// Turn the engine profile on or off for every startup choice.

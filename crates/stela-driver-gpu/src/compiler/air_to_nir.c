@@ -1162,6 +1162,22 @@ flat_input(struct translator *t, gl_varying_slot slot, const char *name)
    return nir_load_var(&t->b, var);
 }
 
+/* A SIMD-group's lanes: stela_air_options::simd_lanes within a wider
+ * subgroup, else the subgroup's. */
+static nir_def *
+simd_lanes(struct translator *t)
+{
+   return t->options->simd_lanes ? nir_imm_int(&t->b, (int)t->options->simd_lanes) :
+                                   nir_load_subgroup_size(&t->b);
+}
+
+/* The SIMD-groups of each subgroup, with stela_air_options::simd_lanes. */
+static nir_def *
+simd_groups_per_subgroup(struct translator *t)
+{
+   return nir_udiv_imm(&t->b, nir_load_subgroup_size(&t->b), t->options->simd_lanes);
+}
+
 /* A builtin input's 32-bit value; positions and sizes are uvec3. */
 static nir_def *
 builtin_value(struct translator *t, enum stela_air_builtin builtin)
@@ -1213,18 +1229,30 @@ builtin_value(struct translator *t, enum stela_air_builtin builtin)
          return nir_ushr_imm(b, nir_load_local_invocation_index(b), 2);
       return nir_load_local_invocation_index(b);
    case STELA_AIR_SIMDGROUP_INDEX_IN_THREADGROUP:
+      /* Within a wider subgroup, its SIMD-groups follow its lanes. */
+      if (t->options->simd_lanes)
+         return nir_iadd(b, nir_imul(b, nir_load_subgroup_id(b), simd_groups_per_subgroup(t)),
+                         nir_udiv_imm(b, nir_load_subgroup_invocation(b), t->options->simd_lanes));
       return nir_load_subgroup_id(b);
    case STELA_AIR_SIMDGROUPS_PER_THREADGROUP:
    case STELA_AIR_DISPATCH_SIMDGROUPS_PER_THREADGROUP: {
       bool running = builtin == STELA_AIR_SIMDGROUPS_PER_THREADGROUP;
+      nir_def *lanes = simd_lanes(t);
       /* A tile's workgroup is its padded threads, as Apple's SIMD-groups. */
-      if (t->options->tile || (!t->options->dynamic_shape && !(running && grid_bounded(t))))
-         return nir_load_num_subgroups(b);
+      if (t->options->tile || (!t->options->dynamic_shape && !(running && grid_bounded(t)))) {
+         if (!t->options->simd_lanes)
+            return nir_load_num_subgroups(b);
+         /* A wider subgroup's SIMD-groups past the threadgroup's threads
+          * hold none: a threadgroup has its threads' SIMD-groups. */
+         if (!t->options->tile && !t->options->dynamic_shape)
+            return nir_imm_int(b, (int)DIV_ROUND_UP(size[0] * size[1] * size[2],
+                                                    t->options->simd_lanes));
+         return nir_imul(b, nir_load_num_subgroups(b), simd_groups_per_subgroup(t));
+      }
       value = running ? running_shape(t) : threadgroup_shape(t);
       if (!value)
          return NULL;
-      return nir_udiv(b, nir_iadd(b, volume(b, value), nir_iadd_imm(b, nir_load_subgroup_size(b), -1)),
-                      nir_load_subgroup_size(b));
+      return nir_udiv(b, nir_iadd(b, volume(b, value), nir_iadd_imm(b, lanes, -1)), lanes);
    }
    case STELA_AIR_QUADGROUPS_PER_THREADGROUP:
    case STELA_AIR_DISPATCH_QUADGROUPS_PER_THREADGROUP: {
@@ -1244,10 +1272,12 @@ builtin_value(struct translator *t, enum stela_air_builtin builtin)
       return nir_ushr_imm(b, nir_iadd_imm(b, volume(b, value), 3), 2);
    }
    case STELA_AIR_THREAD_INDEX_IN_SIMDGROUP:
+      if (t->options->simd_lanes)
+         return nir_iand_imm(b, nir_load_subgroup_invocation(b), t->options->simd_lanes - 1);
       return nir_load_subgroup_invocation(b);
    case STELA_AIR_THREADS_PER_SIMDGROUP:
    case STELA_AIR_THREAD_EXECUTION_WIDTH:
-      return nir_load_subgroup_size(b);
+      return simd_lanes(t);
    case STELA_AIR_THREAD_INDEX_IN_QUADGROUP:
       return nir_iand_imm(b, nir_load_subgroup_invocation(b), 3);
    case STELA_AIR_VERTEX_ID:
@@ -6855,8 +6885,12 @@ async_copy_call(struct translator *t, LLVMValueRef inst, const char *name, size_
    c.dst_stride = nir_u2u64(b, c.dst_stride);
    c.src_row = nir_u2u64(b, c.src_row);
    c.src_stride = nir_u2u64(b, c.src_stride);
-   c.lane = nir_load_subgroup_invocation(b);
-   c.lanes = nir_load_subgroup_size(b);
+   /* A SIMD-group's lanes, within a wider subgroup its own: each copies
+    * the whole tile, as the SIMD-group that called it. */
+   c.lanes = simd_lanes(t);
+   c.lane = t->options->simd_lanes ?
+               nir_iand_imm(b, nir_load_subgroup_invocation(b), t->options->simd_lanes - 1) :
+               nir_load_subgroup_invocation(b);
    /* Each thread copies every lanes-th element; a zero-width tile none. */
    nir_def *rounds = nir_udiv(b, nir_iadd(b, c.count, nir_iadd_imm(b, c.lanes, -1)), c.lanes);
    rounds = nir_bcsel(b, nir_ieq_imm(b, c.width, 0), nir_imm_int(b, 0), rounds);
@@ -7905,6 +7939,7 @@ instruction(struct translator *t, LLVMValueRef inst)
       const struct stela_air_call_context math_context = {
          .b = &t->b, .error = t->error, .translator = t,
          .fragment = t->stage_options && t->stage_options->stage == STELA_AIR_FRAGMENT,
+         .simd_lanes = t->options->simd_lanes,
          .operand = texture_operand, .fp_environment = math_environment, .load = call_load,
          .store = call_store,
       };

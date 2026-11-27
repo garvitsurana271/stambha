@@ -381,6 +381,9 @@ pub struct Target {
     /// (`FLOAT_ADD_DEVICE`, `FLOAT_ADD_THREADGROUP`), compiled as
     /// compare-and-swap loops.
     pub(super) float_add_by_swap: u32,
+    /// A SIMD-group's lanes where the driver's subgroups are wider
+    /// ([`super::simd_lanes`]); 0 for the driver's subgroup.
+    pub(super) simd_lanes: u32,
 }
 
 /// `STELA_METAL_FLOAT_ADD_DEVICE` and `STELA_METAL_FLOAT_ADD_THREADGROUP`.

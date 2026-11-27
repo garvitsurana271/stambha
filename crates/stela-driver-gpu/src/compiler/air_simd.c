@@ -17,7 +17,12 @@
  *
  * A quad-group is four consecutive SIMD lanes. Data moves through one 32-bit
  * shuffle from a computed lane, which every backend supports. Out-of-range
- * shuffle_up and shuffle_down lanes keep their own value, as Metal specifies. */
+ * shuffle_up and shuffle_down lanes keep their own value, as Metal specifies.
+ *
+ * Where the backend's subgroups are wider than a SIMD-group (a wave64-only
+ * GPU's 64 lanes, with stela_air_options::simd_lanes 32), a SIMD-group is
+ * simd_lanes consecutive lanes of its subgroup, as a quad-group is four: a
+ * function spans those lanes alone, as on Apple GPUs. */
 #include "air_simd.h"
 #include <stdio.h>
 #include <string.h>
@@ -60,21 +65,24 @@ static const struct {
    {"is_first", IS_FIRST}, {"is_helper_thread", IS_HELPER},
 };
 
-/* The lanes a function spans: the whole SIMD-group, or the caller's quad. */
+/* The lanes a function spans: the whole subgroup, or a cluster of it, the
+ * caller's quad or its SIMD-group within a wider subgroup. */
 struct group {
-   bool quad;
-   nir_def *base;  /* The group's first SIMD lane. */
-   nir_def *index; /* The caller's index in the group. */
-   nir_def *size;  /* The group's lanes, a power of two. */
+   unsigned cluster; /* The group's lanes, a power of two; 0 for the subgroup. */
+   nir_def *base;    /* The group's first lane in the subgroup. */
+   nir_def *index;   /* The caller's index in the group. */
+   nir_def *size;    /* The group's lanes. */
 };
 
 static struct group
-group(nir_builder *b, bool quad)
+group(nir_builder *b, bool quad, unsigned simd_lanes)
 {
    nir_def *lane = nir_load_subgroup_invocation(b);
-   if (!quad)
-      return (struct group){false, nir_imm_int(b, 0), lane, nir_load_subgroup_size(b)};
-   return (struct group){true, nir_iand_imm(b, lane, ~3u), nir_iand_imm(b, lane, 3), nir_imm_int(b, 4)};
+   unsigned cluster = quad ? 4 : simd_lanes;
+   if (!cluster)
+      return (struct group){0, nir_imm_int(b, 0), lane, nir_load_subgroup_size(b)};
+   return (struct group){cluster, nir_iand_imm(b, lane, ~(cluster - 1)),
+                         nir_iand_imm(b, lane, cluster - 1), nir_imm_int(b, (int)cluster)};
 }
 
 /* The group's lanes for which `predicate` holds, as bits from its first lane. */
@@ -82,7 +90,10 @@ static nir_def *
 active(nir_builder *b, nir_def *predicate, const struct group *g)
 {
    nir_def *lanes = nir_ballot(b, 1, 64, predicate);
-   return g->quad ? nir_iand_imm(b, nir_ushr(b, lanes, g->base), 0xf) : lanes;
+   if (!g->cluster)
+      return lanes;
+   uint64_t mask = g->cluster >= 64 ? UINT64_MAX : (UINT64_C(1) << g->cluster) - 1;
+   return nir_iand_imm(b, nir_ushr(b, lanes, g->base), mask);
 }
 
 /* v from SIMD lane `source`, moved in 32-bit words. */
@@ -118,8 +129,8 @@ move(nir_builder *b, enum operation operation, nir_def *v, nir_def *operand, con
    case SHUFFLE_DOWN:
    case ROTATE_DOWN: source = nir_iand(b, nir_iadd(b, g->index, delta), last); break;
    default:
-      source = g->quad ? nir_find_lsb(b, active(b, nir_imm_true(b), g)) :
-                         nir_read_first_invocation(b, g->index);
+      source = g->cluster ? nir_find_lsb(b, active(b, nir_imm_true(b), g)) :
+                            nir_read_first_invocation(b, g->index);
       break;
    }
    nir_def *moved = shuffle(b, v, nir_iadd(b, g->base, source));
@@ -180,6 +191,28 @@ quad_scan(nir_builder *b, nir_op op, nir_def *v, nir_def *identity, bool inclusi
    return result;
 }
 
+/* A SIMD-group's prefix scan within a wider subgroup: one scan of the
+ * subgroup for each of its SIMD-groups, in which every other group's lanes
+ * give the identity, and each lane's from its own group's. The subgroup's
+ * scan takes only its active lanes, as Metal's does the SIMD-group's. */
+static nir_def *
+cluster_scan(nir_builder *b, nir_op op, nir_def *v, nir_def *identity, bool inclusive,
+             const struct group *g)
+{
+   /* A wave64 subgroup's SIMD-groups; a narrower subgroup's are fewer, and
+    * its scans past them give no lane theirs. */
+   unsigned groups = 64 / g->cluster;
+   nir_def *result = identity;
+   for (unsigned i = 0; i < groups; i++) {
+      nir_def *mine = nir_ieq_imm(b, g->base, i * g->cluster);
+      nir_def *operand = nir_bcsel(b, mine, v, identity);
+      nir_def *scan = inclusive ? nir_inclusive_scan(b, operand, .reduction_op = op) :
+                                  nir_exclusive_scan(b, operand, .reduction_op = op);
+      result = nir_bcsel(b, mine, scan, result);
+   }
+   return result;
+}
+
 static nir_def *
 reduce(nir_builder *b, enum operation operation, nir_def *v, bool floating, bool sign,
        const struct group *g)
@@ -198,16 +231,18 @@ reduce(nir_builder *b, enum operation operation, nir_def *v, bool floating, bool
    switch (operation) {
    case INCLUSIVE_SUM:
    case INCLUSIVE_PRODUCT:
-      result = g->quad ? quad_scan(b, op, v, identity, true, g) :
-                         nir_inclusive_scan(b, v, .reduction_op = op);
+      result = g->cluster == 4 ? quad_scan(b, op, v, identity, true, g) :
+               g->cluster      ? cluster_scan(b, op, v, identity, true, g) :
+                                 nir_inclusive_scan(b, v, .reduction_op = op);
       break;
    case EXCLUSIVE_SUM:
    case EXCLUSIVE_PRODUCT:
-      result = g->quad ? quad_scan(b, op, v, identity, false, g) :
-                         nir_exclusive_scan(b, v, .reduction_op = op);
+      result = g->cluster == 4 ? quad_scan(b, op, v, identity, false, g) :
+               g->cluster      ? cluster_scan(b, op, v, identity, false, g) :
+                                 nir_exclusive_scan(b, v, .reduction_op = op);
       break;
    default:
-      result = nir_reduce(b, v, .reduction_op = op, .cluster_size = g->quad ? 4 : 0);
+      result = nir_reduce(b, v, .reduction_op = op, .cluster_size = g->cluster);
       break;
    }
    return widen ? nir_u2uN(b, result, bits) : result;
@@ -238,7 +273,7 @@ typed(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef ca
       if (!(v[i] = c->operand(c->translator, LLVMGetOperand(call, i))))
          return STELA_AIR_CALL_FAILED;
    }
-   struct group g = group(c->b, quad);
+   struct group g = group(c->b, quad, c->simd_lanes);
    *result = filled ? fill(c->b, operation, v[0], v[1], v[2], v[3], &g) :
              operation < SUM ? move(c->b, operation, v[0], lane ? v[1] : NULL, &g) :
                                reduce(c->b, operation, v[0], floating, sign, &g);
@@ -264,14 +299,15 @@ vote(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef cal
    nir_def *predicate = bare ? nir_imm_true(b) : c->operand(c->translator, LLVMGetOperand(call, 0));
    if (!predicate)
       return STELA_AIR_CALL_FAILED;
-   struct group g = group(b, quad);
+   struct group g = group(b, quad, c->simd_lanes);
    switch (operation) {
    case ALL:
-      *result = quad ? nir_ieq(b, active(b, predicate, &g), active(b, nir_imm_true(b), &g)) :
-                       nir_vote_all(b, 1, predicate);
+      *result = g.cluster ? nir_ieq(b, active(b, predicate, &g), active(b, nir_imm_true(b), &g)) :
+                            nir_vote_all(b, 1, predicate);
       break;
    case ANY:
-      *result = quad ? nir_ine_imm(b, active(b, predicate, &g), 0) : nir_vote_any(b, 1, predicate);
+      *result = g.cluster ? nir_ine_imm(b, active(b, predicate, &g), 0) :
+                            nir_vote_any(b, 1, predicate);
       break;
    case BALLOT:
    case ACTIVE:
@@ -282,7 +318,8 @@ vote(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef cal
                                                                 nir_imm_false(b);
       break;
    default:
-      *result = quad ? nir_ieq(b, nir_find_lsb(b, active(b, predicate, &g)), g.index) : nir_elect(b, 1);
+      *result = g.cluster ? nir_ieq(b, nir_find_lsb(b, active(b, predicate, &g)), g.index) :
+                            nir_elect(b, 1);
       break;
    }
    return STELA_AIR_CALL_LOWERED;
@@ -303,7 +340,9 @@ stela_air_simd_call(const struct stela_air_call_context *c, LLVMValueRef call, L
       if (stela_air_call_named(name, bytes, expected)) {
          if (!stela_air_call_plain(c, call, callee, 0))
             return STELA_AIR_CALL_FAILED;
-         *result = nir_u2uN(c->b, nir_load_subgroup_size(c->b), LLVMGetIntTypeWidth(LLVMTypeOf(call)));
+         nir_def *lanes = c->simd_lanes ? nir_imm_int(c->b, (int)c->simd_lanes) :
+                                          nir_load_subgroup_size(c->b);
+         *result = nir_u2uN(c->b, lanes, LLVMGetIntTypeWidth(LLVMTypeOf(call)));
          return STELA_AIR_CALL_LOWERED;
       }
    }

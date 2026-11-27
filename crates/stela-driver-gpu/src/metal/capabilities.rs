@@ -997,7 +997,13 @@ impl Derivation<'_> {
                 depth: u64::from(workgroup[2]),
             },
             max_total_threads_per_threadgroup: u64::from(limits.max_compute_work_group_invocations),
-            thread_execution_width: u64::from(limits.max_subgroup_size),
+            // A wider subgroup runs SIMD-groups of an Apple GPU's lanes
+            // (`compiler::simd_lanes`).
+            thread_execution_width: u64::from(
+                limits
+                    .max_subgroup_size
+                    .min(super::compiler::APPLE_SIMD_LANES),
+            ),
             max_threadgroup_memory_length: u64::from(limits.max_compute_shared_memory_size),
             max_buffer_length: limits
                 .max_buffer_size

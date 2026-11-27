@@ -455,6 +455,7 @@ impl AirCompiler {
             .into_iter()
             .filter(|(supported, _)| !supported)
             .fold(0, |memory, (_, bit)| memory | bit),
+            simd_lanes: simd_lanes(limits.max_subgroup_size),
         };
         // The boot image mounts the linked AIR compiler. Hosted all-feature
         // builds also expose `Service::linked`, but only pull in its external
@@ -2034,9 +2035,45 @@ unsafe extern "C" {
     fn free(pointer: *mut c_void);
 }
 
+/// The lanes of an Apple GPU's SIMD-group, which Metal's shaders are
+/// written for.
+pub const APPLE_SIMD_LANES: u32 = 32;
+
+/// A SIMD-group's lanes on a driver whose subgroups run `subgroup` lanes:
+/// [`APPLE_SIMD_LANES`] where they are wider, as a wave64-only GPU's (GCN
+/// and Vega: RADV gives GFX9 no wave32), whose each subgroup then runs as
+/// two SIMD-groups; 0, the driver's subgroup, otherwise. Core Animation's
+/// shaders, written for 32 lanes, hung such a GPU and drew parts of macOS's
+/// windows wrong when a SIMD-group was its 64.
+pub fn simd_lanes(subgroup: u32) -> u32 {
+    if subgroup > APPLE_SIMD_LANES {
+        APPLE_SIMD_LANES
+    } else {
+        0
+    }
+}
+
+/// The Vulkan subgroup size a compute pipeline of Metal thread execution
+/// `width` requires on a device whose subgroups are `min..=max` lanes wide,
+/// and whether it requires full subgroups: `width` itself where the device
+/// has it, else its narrowest subgroup, where the shader runs `width`-lane
+/// SIMD-groups inside each ([`simd_lanes`]) and a threadgroup that is a
+/// multiple of `width` need not fill one. Vega's subgroups are 64 lanes
+/// only: requiring 32 there had ACO compile wave32 code GFX9 lacks
+/// (`s_and_saveexec_b32`) and abort.
+pub fn vulkan_subgroup(width: u32, full: bool, min: u32, max: u32) -> (u32, bool) {
+    if width == 0 || min == 0 || (min..=max).contains(&width) {
+        (width, full)
+    } else if width < min {
+        (min, false)
+    } else {
+        (max, false)
+    }
+}
+
 /// Every limit of `target`, which the NIR it compiles depends on, in the
 /// order of its fields; the driver's NIR options are keyed by its build.
-fn target_limits(target: &ffi::Target) -> [u32; 12] {
+fn target_limits(target: &ffi::Target) -> [u32; 13] {
     let ffi::Target {
         nir: _,
         max_instructions,
@@ -2051,6 +2088,7 @@ fn target_limits(target: &ffi::Target) -> [u32; 12] {
         raster_order_groups,
         fragment_tests,
         float_add_by_swap,
+        simd_lanes,
     } = *target;
     [
         max_instructions,
@@ -2065,6 +2103,7 @@ fn target_limits(target: &ffi::Target) -> [u32; 12] {
         raster_order_groups,
         fragment_tests,
         float_add_by_swap,
+        simd_lanes,
     ]
 }
 

@@ -1721,6 +1721,29 @@ fn function_constant_types_follow_their_spelling() {
 }
 
 #[test]
+fn a_pipeline_requires_a_subgroup_size_the_device_has() {
+    // Vega: 64 lanes only; Metal's width of 32 runs two SIMD-groups a wave.
+    assert_eq!(vulkan_subgroup(32, true, 64, 64), (64, false));
+    assert_eq!(vulkan_subgroup(32, false, 64, 64), (64, false));
+    // RDNA: wave32 or wave64; 32 is kept, with full subgroups.
+    assert_eq!(vulkan_subgroup(32, true, 32, 64), (32, true));
+    // NVIDIA: 32 only.
+    assert_eq!(vulkan_subgroup(32, true, 32, 32), (32, true));
+    // No size control reported: the request is left as it was.
+    assert_eq!(vulkan_subgroup(32, true, 0, 0), (32, true));
+}
+
+#[test]
+fn a_wider_subgroup_runs_apple_simd_groups() {
+    // Vega's wave64 runs two SIMD-groups of 32; RDNA's wave32, NVIDIA's 32
+    // and Intel's 8 to 32 run one each.
+    assert_eq!(super::simd_lanes(64), 32);
+    for subgroup in [32, 16, 8] {
+        assert_eq!(super::simd_lanes(subgroup), 0);
+    }
+}
+
+#[test]
 fn every_target_limit_keys_the_nir_a_compilation_stores() {
     let base = ffi::Target {
         nir: [ptr::null(); NIR_STAGES],
@@ -1736,9 +1759,10 @@ fn every_target_limit_keys_the_nir_a_compilation_stores() {
         raster_order_groups: 10,
         fragment_tests: 11,
         float_add_by_swap: 12,
+        simd_lanes: 13,
     };
     let limits = target_limits(&base);
-    assert_eq!(limits, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(limits, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     // Where the driver's NIR options live is no limit: it differs by boot.
     let moved = ffi::Target {
         nir: [ptr::dangling(); NIR_STAGES],

@@ -12,6 +12,9 @@ struct stela_air_call_context {
    void *translator;
    /* Derivatives and discard exist only in fragment functions. */
    bool fragment;
+   /* stela_air_options::simd_lanes: a SIMD-group's lanes within a wider
+    * subgroup, or zero for the subgroup. */
+   unsigned simd_lanes;
    /* An operand's NIR value, or NULL after reporting why. */
    nir_def *(*operand)(void *translator, LLVMValueRef value);
    /* Admits the function's floating-point environment before an FP result;

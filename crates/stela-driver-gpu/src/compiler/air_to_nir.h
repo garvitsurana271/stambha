@@ -419,6 +419,12 @@ struct stela_air_tile {
 
 struct stela_air_options {
    unsigned workgroup_size[3]; /* Exact nonzero pipeline specialization. */
+   /* A SIMD-group's lanes, a power of two, where the backend's subgroups
+    * are wider: each subgroup runs as subgroup_size / simd_lanes SIMD-groups
+    * of consecutive lanes, which every SIMD-group function, builtin and
+    * matrix spans alone, as Apple GPUs run 32. Zero for the backend's
+    * subgroup. */
+   unsigned simd_lanes;
    /* A kernel's explicit imageblock's width and height, as its encoder's
     * setImageblockWidth:height: gives them; zero for the threadgroup's. */
    unsigned imageblock_size[2];

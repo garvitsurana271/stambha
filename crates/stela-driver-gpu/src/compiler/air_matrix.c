@@ -18,7 +18,9 @@
  * is opaque storage whose elements 0 and 1 are the thread's
  * thread_elements(). Each of a SIMD-group's 32 lanes holds two, as on Apple
  * GPUs: lane l those of row 4 (l / 16) + (l / 2) % 4 at columns
- * 4 ((l / 8) % 2) + 2 (l % 2) and the next. Memory holds
+ * 4 ((l / 8) % 2) + 2 (l % 2) and the next. Within a wider subgroup
+ * (stela_air_options::simd_lanes 32), l is the lane in the caller's
+ * SIMD-group and every move stays in its lanes. Memory holds
  * column c and row r at element (origin.x + c) strides.x + (origin.y + r)
  * strides.y; the extent, the elements a row and the matrix's rows in that
  * order, bounds nothing. A product gathers each row of a and column of b by shuffles and
@@ -58,11 +60,20 @@ element_kind(LLVMTypeRef matrix)
    return LLVMGetTypeKind(LLVMGetElementType(matrix));
 }
 
-/* This lane's row and first column. */
-static void
-position(nir_builder *b, nir_def **row, nir_def **column)
+/* This lane's index in its SIMD-group, of `simd` lanes within a wider
+ * subgroup, or of the subgroup with 0. */
+static nir_def *
+simd_lane(nir_builder *b, unsigned simd)
 {
    nir_def *lane = nir_load_subgroup_invocation(b);
+   return simd ? nir_iand_imm(b, lane, simd - 1) : lane;
+}
+
+/* This lane's row and first column. */
+static void
+position(nir_builder *b, unsigned simd, nir_def **row, nir_def **column)
+{
+   nir_def *lane = simd_lane(b, simd);
    *row = nir_iadd(b, nir_ishl_imm(b, nir_ushr_imm(b, lane, 4), 2),
                    nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 3));
    *column = nir_iadd(b, nir_ishl_imm(b, nir_iand_imm(b, nir_ushr_imm(b, lane, 3), 1), 2),
@@ -101,10 +112,13 @@ narrow(nir_builder *b, nir_def *pair, LLVMTypeKind element)
    }
 }
 
-/* `pair` from SIMD lane `source`, moved in 32-bit words. */
+/* `pair` from SIMD lane `source` of the caller's SIMD-group, moved in
+ * 32-bit words. */
 static nir_def *
-from_lane(nir_builder *b, nir_def *pair, nir_def *source)
+from_lane(nir_builder *b, unsigned simd, nir_def *pair, nir_def *source)
 {
+   if (simd)
+      source = nir_iadd(b, nir_iand_imm(b, nir_load_subgroup_invocation(b), ~(simd - 1)), source);
    if (pair->bit_size == 16)
       return nir_unpack_32_2x16(b, nir_shuffle(b, nir_pack_32_2x16(b, pair), source));
    return nir_vec2(b, nir_shuffle(b, nir_channel(b, pair, 0), source),
@@ -114,19 +128,20 @@ from_lane(nir_builder *b, nir_def *pair, nir_def *source)
 /* a * x + c: this lane's row of a meets its two columns of x, each pair of
  * a's row and x's row k at this lane's columns from the lane holding it. */
 static nir_def *
-multiply_accumulate(nir_builder *b, LLVMTypeRef result, LLVMValueRef call, nir_def *a, nir_def *x,
+multiply_accumulate(nir_builder *b, unsigned simd, LLVMTypeRef result, LLVMValueRef call,
+                    nir_def *a, nir_def *x,
                     nir_def *c)
 {
    nir_def *row, *column;
-   position(b, &row, &column);
+   position(b, simd, &row, &column);
    nir_def *quad = nir_ushr_imm(b, column, 1);
    LLVMTypeKind a_kind = element_kind(LLVMTypeOf(LLVMGetOperand(call, 0)));
    LLVMTypeKind x_kind = element_kind(LLVMTypeOf(LLVMGetOperand(call, 1)));
    nir_def *sum = widen(b, c, element_kind(LLVMTypeOf(LLVMGetOperand(call, 2))));
    for (unsigned j = 0; j < 4; j++) {
-      nir_def *pair = widen(b, from_lane(b, a, lane_of(b, row, nir_imm_int(b, j))), a_kind);
+      nir_def *pair = widen(b, from_lane(b, simd, a, lane_of(b, row, nir_imm_int(b, j))), a_kind);
       for (unsigned h = 0; h < 2; h++) {
-         nir_def *columns = widen(b, from_lane(b, x, lane_of(b, nir_imm_int(b, 2 * j + h), quad)), x_kind);
+         nir_def *columns = widen(b, from_lane(b, simd, x, lane_of(b, nir_imm_int(b, 2 * j + h), quad)), x_kind);
          sum = nir_ffma(b, nir_channel(b, pair, h), columns, sum);
       }
    }
@@ -137,10 +152,10 @@ multiply_accumulate(nir_builder *b, LLVMTypeRef result, LLVMValueRef call, nir_d
  * column c and row r at element (origin.x + c) strides.x + (origin.y + r)
  * strides.y. */
 static nir_def *
-element_offset(nir_builder *b, unsigned e, unsigned bytes, nir_def *strides, nir_def *origin)
+element_offset(nir_builder *b, unsigned simd, unsigned e, unsigned bytes, nir_def *strides, nir_def *origin)
 {
    nir_def *row, *column;
-   position(b, &row, &column);
+   position(b, simd, &row, &column);
    nir_def *x = nir_iadd(b, nir_channel(b, origin, 0), nir_u2u64(b, nir_iadd_imm(b, column, e)));
    nir_def *y = nir_iadd(b, nir_channel(b, origin, 1), nir_u2u64(b, row));
    nir_def *index = nir_iadd(b, nir_imul(b, x, nir_channel(b, strides, 0)),
@@ -206,7 +221,7 @@ memory(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef c
       return STELA_AIR_CALL_FAILED;
    nir_def *elements[2];
    for (unsigned e = 0; e < 2; e++) {
-      nir_def *offset = element_offset(b, e, bits / 8, strides, origin);
+      nir_def *offset = element_offset(b, c->simd_lanes, e, bits / 8, strides, origin);
       if (store ? !c->store(c->translator, pointer, offset, nir_channel(b, value, e)) :
                   !(elements[e] = c->load(c->translator, pointer, offset, bits)))
          return STELA_AIR_CALL_FAILED;
@@ -248,7 +263,7 @@ stela_air_matrix_call(const struct stela_air_call_context *c, LLVMValueRef call,
             *result = nir_vec2(b, value, value);
          } else {
             nir_def *row, *column, *zero = nir_imm_zero(b, 1, bits);
-            position(b, &row, &column);
+            position(b, c->simd_lanes, &row, &column);
             *result = nir_vec2(b, nir_bcsel(b, nir_ieq(b, column, row), value, zero),
                                nir_bcsel(b, nir_ieq(b, nir_iadd_imm(b, column, 1), row), value, zero));
          }
@@ -277,7 +292,7 @@ stela_air_matrix_call(const struct stela_air_call_context *c, LLVMValueRef call,
                   if (!(values[i] = c->operand(c->translator, LLVMGetOperand(call, i))))
                      return STELA_AIR_CALL_FAILED;
                }
-               *result = multiply_accumulate(b, type, call, values[0], values[1], values[2]);
+               *result = multiply_accumulate(b, c->simd_lanes, type, call, values[0], values[1], values[2]);
                return STELA_AIR_CALL_LOWERED;
             }
          }

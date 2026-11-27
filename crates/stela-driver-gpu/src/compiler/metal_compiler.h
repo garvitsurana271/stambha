@@ -126,8 +126,13 @@ struct stela_metal_target {
     * (STELA_METAL_FLOAT_ADD_*): each such add of a function is a
     * compare-and-swap loop instead, as Vulkan's integer atomics allow. */
    uint32_t float_add_by_swap;
+   /* A SIMD-group's lanes where the driver's subgroups are wider: 32 splits
+    * each of a wave64-only GPU's subgroups into two SIMD-groups of 32, as
+    * Apple GPUs run them (stela_air_options::simd_lanes); 0 for the
+    * driver's subgroup. */
+   uint32_t simd_lanes;
 };
-#define STELA_METAL_TARGET_BYTES 112u
+#define STELA_METAL_TARGET_BYTES 120u
 #define STELA_METAL_FLOAT_ADD_DEVICE 1u
 #define STELA_METAL_FLOAT_ADD_THREADGROUP 2u
 

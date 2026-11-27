@@ -2078,6 +2078,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         indirect_bindable: bool,
         sources: &Sources,
     ) -> Result<Pipeline> {
+        // Every variant, a dispatch's specialization as well as the
+        // pipeline's own, requires a subgroup size the device has.
+        let physical = self.backend.physical_device();
+        let (width, full_subgroups) = super::super::compiler::vulkan_subgroup(
+            width,
+            full_subgroups,
+            physical.limits.min_subgroup_size,
+            physical.limits.max_subgroup_size,
+        );
         let compiled = self.compile(function, specialization)?;
         let mut info = ComputePipelineInfo {
             code: compiled.code,

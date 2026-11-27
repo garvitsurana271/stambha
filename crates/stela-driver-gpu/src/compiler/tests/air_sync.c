@@ -40,6 +40,10 @@ static const char *shared = "@s = internal addrspace(3) global [64 x i32] undef,
 
 static struct stela_metal_stage primary = {.table = STELA_METAL_TABLE_PRIMARY};
 
+/* The SIMD-group lanes translations take (stela_air_options::simd_lanes):
+ * 32 within the 64-lane subgroups a wave64-only GPU runs, else 0. */
+static unsigned simd_lanes_option;
+
 static nir_shader *
 translate(const char *declarations, const char *body, const nir_shader_compiler_options *options,
           stela_air_bind_buffer bind, struct stela_air_error *error)
@@ -51,7 +55,7 @@ translate(const char *declarations, const char *body, const nir_shader_compiler_
    const struct stela_air_options o = {
       .workgroup_size = {64, 1, 1}, .max_instructions = 10000, .max_threadgroup_bytes = 256, .max_private_bytes = 64,
       .bind_buffer = bind, .binding_data = &primary,
-      .fp_profile = STELA_AIR_FP_METAL,
+      .fp_profile = STELA_AIR_FP_METAL, .simd_lanes = simd_lanes_option,
    };
    *error = (struct stela_air_error){0};
    nir_shader *shader = stela_air_to_nir(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
@@ -689,7 +693,11 @@ simd_functions_lower_to_subgroup_operations(void)
            "%a = call i32 @air.simd_shuffle.i32(i32 1, i16 3)\nret void\n", STELA_AIR_INSTRUCTION);
 }
 
-enum { SIMD_LANES = 32, MAX_SHUFFLES = 128 };
+enum { SIMD_LANES = 32, MAX_LANES = 64, MAX_SHUFFLES = 128 };
+
+/* The lanes a run's subgroup has: a SIMD-group's 32, or a wave64-only GPU's
+ * 64, as two SIMD-groups with simd_lanes_option 32. */
+static unsigned subgroup_lanes = SIMD_LANES;
 
 /* Rewrites a lane's uses of `def` with the `bits` constant `value`; whether
  * it had any. */
@@ -709,10 +717,12 @@ struct shuffle {
    nir_intrinsic_instr *data, *source, *result;
 };
 
-/* Runs `body` on one SIMD-group of 32 lanes over `memory`, the buffer at
- * BUFFER: each lane is a clone given its index, whose global loads read
- * `memory` and whose shuffles read the other lanes' values, folded until
- * every one is known. Each lane's stores then write `memory`. */
+/* Runs `body` on one subgroup of subgroup_lanes lanes over `memory`, the
+ * buffer at BUFFER: each lane is a clone given its index, whose global loads
+ * read `memory` and whose shuffles read the other lanes' values, folded until
+ * every one is known. Each lane's stores then write `memory`, in lane order:
+ * in a 64-lane subgroup of two SIMD-groups computing the same, the second
+ * group's stores are what `memory` holds. */
 static void
 run_simdgroup(const char *declarations, const char *body, uint8_t *memory, size_t size)
 {
@@ -722,10 +732,11 @@ run_simdgroup(const char *declarations, const char *body, uint8_t *memory, size_
 #ifdef STELA_AIR_TEST_NAK
    stela_air_test_nak(nak_translate, &(struct fixture){declarations, body});
 #endif
-   nir_shader *lanes[SIMD_LANES];
-   static struct shuffle shuffles[SIMD_LANES][MAX_SHUFFLES];
+   nir_shader *lanes[MAX_LANES];
+   static struct shuffle shuffles[MAX_LANES][MAX_SHUFFLES];
+   const unsigned lane_count = subgroup_lanes;
    unsigned count = 0;
-   for (unsigned l = 0; l < SIMD_LANES; l++) {
+   for (unsigned l = 0; l < lane_count; l++) {
       lanes[l] = nir_shader_clone(NULL, shader);
       count = 0;
       nir_foreach_function_impl(impl, lanes[l]) {
@@ -737,6 +748,8 @@ run_simdgroup(const char *declarations, const char *body, uint8_t *memory, size_
                nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
                if (intrinsic->intrinsic == nir_intrinsic_load_subgroup_invocation) {
                   fold_use(&intrinsic->def, l);
+               } else if (intrinsic->intrinsic == nir_intrinsic_load_subgroup_size) {
+                  fold_use(&intrinsic->def, lane_count);
                } else if (intrinsic->intrinsic == nir_intrinsic_shuffle) {
                   assert(count < MAX_SHUFFLES && intrinsic->def.bit_size == 32 &&
                          intrinsic->def.num_components == 1);
@@ -757,7 +770,7 @@ run_simdgroup(const char *declarations, const char *body, uint8_t *memory, size_
    ralloc_free(shader);
    for (bool progress = true; progress;) {
       progress = false;
-      for (unsigned l = 0; l < SIMD_LANES; l++) {
+      for (unsigned l = 0; l < lane_count; l++) {
          while (nir_opt_constant_folding(lanes[l]) | nir_opt_dead_cf(lanes[l]))
             ;
          nir_foreach_function_impl(impl, lanes[l]) {
@@ -776,20 +789,20 @@ run_simdgroup(const char *declarations, const char *body, uint8_t *memory, size_
             }
          }
       }
-      for (unsigned l = 0; l < SIMD_LANES; l++) {
+      for (unsigned l = 0; l < lane_count; l++) {
          for (unsigned k = 0; k < count; k++) {
             const struct shuffle *s = &shuffles[l][k];
             if (!nir_src_is_const(s->source->src[0]))
                continue;
             unsigned source = nir_src_as_uint(s->source->src[0]);
-            assert(source < SIMD_LANES);
+            assert(source < lane_count);
             nir_src *data = &shuffles[source][k].data->src[0];
             if (nir_src_is_const(*data))
                progress |= fold_use(&s->result->def, nir_src_as_uint(*data));
          }
       }
    }
-   for (unsigned l = 0; l < SIMD_LANES; l++) {
+   for (unsigned l = 0; l < lane_count; l++) {
       nir_foreach_function_impl(impl, lanes[l]) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
@@ -1143,6 +1156,69 @@ refuses_misused_matrices(void)
               refusals[i][2][0] == 'i' ? STELA_AIR_INSTRUCTION : STELA_AIR_TYPE);
 }
 
+/* On a wave64-only GPU, each 64-lane subgroup runs two SIMD-groups of 32:
+ * a function spans its group's lanes, as on an Apple GPU. */
+static void
+simd_functions_span_their_simdgroup_within_a_wider_subgroup(void)
+{
+   simd_lanes_option = 32;
+   nir_shader *shader = lowered(
+      "declare i32 @air.simd_sum.s.i32(i32)\n"
+      "declare i32 @air.simd_prefix_exclusive_sum.u.i32(i32)\n"
+      "declare i64 @air.simd_ballot.i64(i1)\n"
+      "declare i1 @air.simd_all(i1)\n"
+      "declare i16 @air.get_simdgroup_size.i16()\n",
+      "%s = call i32 @air.simd_sum.s.i32(i32 1)\n"
+      "%e = call i32 @air.simd_prefix_exclusive_sum.u.i32(i32 %s)\n"
+      "%v = icmp eq i32 %e, 0\n"
+      "%all = call i1 @air.simd_all(i1 %v)\n"
+      "%ballot = call i64 @air.simd_ballot.i64(i1 %all)\n"
+      "%lanes = call i16 @air.get_simdgroup_size.i16()\n"
+      "%bt = trunc i64 %ballot to i32\n%lz = zext i16 %lanes to i32\n"
+      "%x = xor i32 %bt, %lz\n"
+      "store i32 %x, ptr addrspace(1) %out, align 4\nret void\n");
+   /* A reduction spans 32 lanes; a scan is one of the subgroup per group,
+    * each of the other group's lanes giving the identity; a vote reads the
+    * group's bits of a ballot, and the size is the group's. */
+   unsigned reductions = 0, clustered = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intrinsic = nir_instr_as_intrinsic(instr);
+            if (intrinsic->intrinsic == nir_intrinsic_reduce) {
+               reductions++;
+               clustered += nir_intrinsic_cluster_size(intrinsic) == 32;
+            }
+            assert(intrinsic->intrinsic != nir_intrinsic_vote_all &&
+                   intrinsic->intrinsic != nir_intrinsic_load_subgroup_size);
+         }
+      }
+   }
+   assert(reductions == 1 && clustered == 1);
+   assert(count(shader, nir_intrinsic_exclusive_scan) == 2);
+   ralloc_free(shader);
+   simd_lanes_option = 0;
+}
+
+/* The SIMD-group matrices on a wave64-only GPU's 64-lane subgroup, whose two
+ * SIMD-groups each compute what one does on an Apple GPU. */
+static void
+matrices_run_in_each_simdgroup_of_a_wider_subgroup(void)
+{
+   simd_lanes_option = 32;
+   subgroup_lanes = MAX_LANES;
+   matrix_products_follow_rows_and_columns();
+   matrix_memory_takes_origins_strides_and_transposes();
+   matrix_memory_takes_extents_strides_and_origins();
+   matrix_elements_and_narrow_types();
+   matrix_constants_name_thread_elements();
+   matrix_arithmetic_is_elementwise();
+   subgroup_lanes = SIMD_LANES;
+   simd_lanes_option = 0;
+}
+
 int
 main(void)
 {
@@ -1162,6 +1238,8 @@ main(void)
    matrix_constants_name_thread_elements();
    matrix_arithmetic_is_elementwise();
    refuses_misused_matrices();
+   simd_functions_span_their_simdgroup_within_a_wider_subgroup();
+   matrices_run_in_each_simdgroup_of_a_wider_subgroup();
    glsl_type_singleton_decref();
    puts("air sync: ok");
    return 0;

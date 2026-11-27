@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rqffael <169403487+rqffael@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:01:17 +0100
+Subject: [PATCH] fix(i915): preallocate active_node outside tree_lock
+
+---
+ drivers/gpu/drm/i915/i915_active.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_active.c b/drivers/gpu/drm/i915/i915_active.c
+index aa77def0..b03276d3 100644
+--- a/drivers/gpu/drm/i915/i915_active.c
++++ b/drivers/gpu/drm/i915/i915_active.c
+@@ -287,13 +287,15 @@ static struct active_node *__active_lookup(struct i915_active *ref, u64 idx)
+ static struct i915_active_fence *
+ active_instance(struct i915_active *ref, u64 idx)
+ {
+-	struct active_node *node;
++	struct active_node *node, *prealloc;
+ 	struct rb_node **p, *parent;
+ 
+ 	node = __active_lookup(ref, idx);
+ 	if (likely(node))
+ 		return &node->base;
+ 
++	prealloc = kmem_cache_alloc(slab_cache, GFP_KERNEL | __GFP_NOWARN);
++
+ 	spin_lock_irq(&ref->tree_lock);
+ 	GEM_BUG_ON(i915_active_is_idle(ref));
+ 
+@@ -314,9 +316,10 @@ active_instance(struct i915_active *ref, u64 idx)
+ 
+ 	/*
+ 	 * XXX: We should preallocate this before i915_active_ref() is ever
+-	 *  called, but we cannot call into fs_reclaim() anyway, so use GFP_ATOMIC.
++	 *  called, so preallocate outside tree_lock before disabling IRQs.
+ 	 */
+-	node = kmem_cache_alloc(slab_cache, GFP_ATOMIC);
++	node = prealloc;
++	prealloc = NULL;
+ 	if (!node)
+ 		goto err;
+ 
+@@ -330,6 +333,8 @@ active_instance(struct i915_active *ref, u64 idx)
+ out:
+ 	WRITE_ONCE(ref->cache, node);
+ 	spin_unlock_irq(&ref->tree_lock);
++	if (prealloc)
++		kmem_cache_free(slab_cache, prealloc);
+ 
+ 	return &node->base;
+ 
+-- 
+2.56.0
+

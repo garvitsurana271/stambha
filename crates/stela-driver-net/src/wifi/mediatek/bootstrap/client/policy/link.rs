@@ -473,6 +473,11 @@ impl<I: BarIo, Q: QueueIo, C: 'static, S: PageSource + 'static> ManagedLink<I, Q
                     | Error::Data(_)
                     | Error::Aggregate(_)
                     | Error::IncompleteParent
+                    | Error::Station(
+                        station::Error::Wire(_)
+                        | station::Error::WrongChannel
+                        | station::Error::Unsupported(_),
+                    )
                     | Error::Key(key::Error::Bip(key::bip::Error::Authentication(_))),
                 )) => s.rejected_frames = s.rejected_frames.saturating_add(1),
                 Err(error) => failure = Some(error),

@@ -1366,6 +1366,37 @@ fn a_tx_retirement_poison_after_a_refused_frame_fails_at_once() {
         assert_eq!(model.drops.load(Ordering::Relaxed), 0);
     }
 }
+#[test]
+fn a_wrong_peer_management_frame_during_join_is_dropped_without_failing_service() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let (mut link, model, join, bss, provider) = setup_link();
+    let bss = scan_join(&mut link, &model, join, bss);
+    assert_eq!(finish_tx(&model)[0][..2], [0xb0, 0]);
+    link.service().unwrap();
+    // A neighbor BSS management frame on the same channel arrives ahead of
+    // our AP's authentication response: drop it without failing service().
+    let mut stray = response(0xb0, &[0, 0, 2, 0, 0, 0]);
+    stray[10] ^= 2;
+    incoming(&model, &stray, None, false);
+    incoming(&model, &response(0xb0, &[0, 0, 2, 0, 0, 0]), None, false);
+    link.service().unwrap();
+    assert_eq!(link.rejected_frames(), 1);
+    link.service().unwrap();
+    assert_eq!(finish_tx(&model)[0][..2], [0, 0]);
+    link.service().unwrap();
+    let mut assoc = vec![0x11, 0, 0, 0, 1, 0xc0];
+    assoc.extend_from_slice(&bss.elements);
+    incoming(&model, &response(0x10, &assoc), None, false);
+    link.service().unwrap();
+    assert_eq!(link.phase(), Phase::AwaitingModernAdmission);
+    link.configure().unwrap();
+    assert_eq!(link.phase(), Phase::Associated);
+    stop(&mut link, &model);
+    drop(link);
+    assert_eq!(provider.load(Ordering::Relaxed), 1);
+}
 
 mod edca_controls;
 mod management_controls;

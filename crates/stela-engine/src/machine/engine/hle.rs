@@ -121,6 +121,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.hle.config.table.len()
     }
 
+    /// The contiguous mapped span holding `pc`: the guest leaf size clamped
+    /// to 16 KiB (XNU's EL0 granule) when larger than [`FETCH_PAGE`], else
+    /// [`FETCH_PAGE`] (4 KiB). A function fitting inside one guest leaf is
+    /// physically contiguous with uniform permissions, so a function like
+    /// macOS `libsystem_platform`'s `__platform_memmove` that crosses a 4 KiB
+    /// fetch boundary inside a 16 KiB page can still be matched safely.
+    fn hle_span(&self, pc: u64) -> u64 {
+        self.cached_fetch(pc)
+            .map(|walk| walk.size.clamp(FETCH_PAGE, 16 * 1024))
+            .unwrap_or(FETCH_PAGE)
+    }
+
     /// At the compile of the block at `pc` (`physical`) from the raw bytes
     /// `source`, its window's first: whether an enabled signature's
     /// function starts there and may be replaced, and its composite
@@ -139,17 +151,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if self.hle.config.enabled == 0 || source.len() > FIRST_WINDOW_BYTES {
             return Ok(None);
         }
-        let Some(head) = source.first_chunk::<PREFIX_BYTES>() else {
-            return Ok(None);
-        };
+        let span = self.hle_span(pc);
+        let offset = pc & (span - 1);
+        let mut head = [0u8; PREFIX_BYTES];
+        match source.first_chunk::<PREFIX_BYTES>() {
+            Some(bytes) => head = *bytes,
+            None if span > FETCH_PAGE
+                && offset + PREFIX_BYTES as u64 <= span
+                && self.host.read_ram(physical, &mut head) => {}
+            None => return Ok(None),
+        }
         if !replaceable(variant, self.cpu.pstate.el) {
             return Ok(None);
         }
-        let offset = pc & (FETCH_PAGE - 1);
         let table = self.hle.config.table.clone();
-        for (index, signature) in crate::hle::find(&table, self.hle.config.enabled, head) {
+        for (index, signature) in crate::hle::find(&table, self.hle.config.enabled, &head) {
             let length = signature.length() as u64;
-            if offset + length > FETCH_PAGE {
+            if offset + length > span {
                 self.hle.statistics.refuse(Refusal::CrossesPage);
                 continue;
             }
@@ -206,9 +224,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .step_by(INSTRUCTION as usize)
             .find(|&offset| {
                 let at = pc + offset as u64;
-                // A prefix past its fetch page is a function that crosses
+                let span = self.hle_span(at);
+                // A prefix past its mapped leaf span is a function that crosses
                 // it, which no compile replaces.
-                if (at & (FETCH_PAGE - 1)) + PREFIX_BYTES as u64 > FETCH_PAGE {
+                if (at & (span - 1)) + PREFIX_BYTES as u64 > span {
                     return false;
                 }
                 let mut head = [0; PREFIX_BYTES];

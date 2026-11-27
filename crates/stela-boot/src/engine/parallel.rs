@@ -352,7 +352,12 @@ impl Pe {
                         });
                     }
                 }
-                stop => stopped(pe, stop),
+                stop => {
+                    if !step_timing && machine.hle_enabled() {
+                        super::run::hle_report(&machine);
+                    }
+                    stopped(pe, stop);
+                }
             }
             if step_timing && machine.hle_enabled() {
                 let counter = host::fresh_counter();

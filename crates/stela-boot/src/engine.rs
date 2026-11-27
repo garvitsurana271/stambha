@@ -1577,6 +1577,9 @@ fn finish<H: Host>(
                 }
                 output::arguments(format_args!("STOP reset: {reset}\n"));
             }
+            if machine.step_timing().is_none() && machine.hle_enabled() {
+                run::hle_report(machine);
+            }
             // The run is over: its blocks' memory goes to proving the new
             // ones.
             machine.discard_every_block();

@@ -682,6 +682,27 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// space mapping the frame shares: a later fetch compiles the page
     /// again. Their code stays installed until its part is reclaimed.
     pub(super) fn invalidate_code_page(&mut self, physical: u64) {
+        self.invalidate_single_code_page(physical);
+        // An HLE composite installed inside a 16 KiB guest leaf may cross one
+        // 4 KiB fetch boundary; retire any HLE block on the preceding 4 KiB
+        // subpage of the same 16 KiB granule.
+        if self.hle_enabled() && (physical & (16 * 1024 - 1)) >= FETCH_PAGE {
+            let prev = (physical & !(FETCH_PAGE - 1)) - FETCH_PAGE;
+            let has_hle = {
+                let code = Arc::clone(&self.code);
+                let cache = code.page_at(prev, board::LockSite::Invalidate);
+                cache
+                    .index
+                    .page(prev)
+                    .any(|slot| code.blocks.get(slot).is_some_and(|b| b.hle.is_some()))
+            };
+            if has_hle {
+                self.invalidate_single_code_page(prev);
+            }
+        }
+    }
+
+    fn invalidate_single_code_page(&mut self, physical: u64) {
         let frame = frame_number(physical);
         let code = Arc::clone(&self.code);
         let mut cache = code.page_at(physical, board::LockSite::Invalidate);

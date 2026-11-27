@@ -340,11 +340,14 @@ fn an_off_config_enables_nothing() {
     for routine in Id::PRODUCTION.into_iter().chain([Id::Bail, Id::Touch]) {
         assert!(!off.enables(routine), "{routine:?}");
     }
-    // Without --hle a boot is off whatever its table, and the generated
-    // table holds nothing yet.
+    // Without --hle a boot is off whatever its table; with --hle the
+    // generated table enables every routine it holds.
     assert_eq!(config::booted(false, &[], two_routines()), off);
     assert_eq!(Config::boot(false, &[]), off);
-    assert_eq!(Config::boot(true, &[]).enabled, 0);
+    assert_eq!(
+        Config::boot(true, &[]).enabled,
+        Id::Memmove.bit() | Id::Bzero.bit()
+    );
     // A routine without a signature is never enabled.
     assert_eq!(Config::with_table(two_routines(), &[Id::Strlen]).enabled, 0);
 }
@@ -440,9 +443,8 @@ fn a_boot_config_describes_its_routines() {
         none.describe(&[Id::Memmove]),
         "on signatures=1 ids=- off=memmove max=65536: no signature is enabled, so no function is replaced"
     );
-    assert!(
-        Config::boot(true, &[])
-            .describe(&[])
-            .starts_with("on signatures=0 ids=- off=- ")
+    assert_eq!(
+        Config::boot(true, &[]).describe(&[]),
+        "on signatures=2 ids=memmove,bzero off=- max=65536"
     );
 }

@@ -736,12 +736,49 @@ pub(crate) fn functions_of(
             if !symbols.contains(&symbol.as_str()) {
                 continue;
             }
-            let next = starts.iter().copied().find(|&start| start > address);
-            let length = next.map_or(limit as u64, |next| (next - address).min(limit as u64));
+            let max_end = address.saturating_add(limit as u64);
+            let mut end = starts
+                .iter()
+                .copied()
+                .find(|&start| start > address)
+                .unwrap_or(max_end)
+                .min(max_end);
             let Some((data, offset)) = cache.data_and_offset_for_address(address) else {
                 continue;
             };
             let offset = usize::try_from(offset)?;
+            // If a function (such as Apple's `__platform_bzero`) branches
+            // forward into an immediately following shared tail (such as
+            // `__platform_memset`), extend its span to the function start
+            // after that target, within `limit`, so it can be verified whole.
+            loop {
+                let len = (end - address) as usize;
+                let Some(slice) = data.get(offset..offset + len) else {
+                    break;
+                };
+                let mut furthest = end;
+                for (index, word) in slice.chunks_exact(4).enumerate() {
+                    if let Some(target) = forward_branch_target(
+                        address + (index * 4) as u64,
+                        u32::from_le_bytes(word.try_into().expect("4 bytes")),
+                    ) && target >= end
+                        && target < max_end
+                    {
+                        let next_end = starts
+                            .iter()
+                            .copied()
+                            .find(|&start| start > target)
+                            .unwrap_or(max_end)
+                            .min(max_end);
+                        furthest = furthest.max(next_end);
+                    }
+                }
+                if furthest == end {
+                    break;
+                }
+                end = furthest;
+            }
+            let length = end - address;
             let Some(bytes) = data.get(offset..offset + length as usize) else {
                 continue;
             };
@@ -754,6 +791,24 @@ pub(crate) fn functions_of(
         }
     }
     Ok(functions)
+}
+
+/// Target address of a forward PC-relative branch (`B`, `B.cond`, `CBZ`/`CBNZ`,
+/// `TBZ`/`TBNZ`), or `None` for any other instruction or backward branch.
+fn forward_branch_target(pc: u64, word: u32) -> Option<u64> {
+    let signed = |bits: u32, width: u32| -> i64 {
+        i64::from(((bits << (32 - width)) as i32) >> (32 - width))
+    };
+    let disp_words = if word & 0xfc00_0000 == 0x1400_0000 {
+        signed(word & 0x03ff_ffff, 26)
+    } else if word & 0xff00_0000 == 0x5400_0000 || word & 0x7e00_0000 == 0x3400_0000 {
+        signed((word & 0x00ff_ffe0) >> 5, 19)
+    } else if word & 0x7e00_0000 == 0x3600_0000 {
+        signed((word & 0x0007_ffe0) >> 5, 14)
+    } else {
+        return None;
+    };
+    (disp_words > 0).then(|| pc.wrapping_add((disp_words * 4) as u64))
 }
 
 #[cfg(test)]

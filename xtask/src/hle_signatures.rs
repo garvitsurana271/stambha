@@ -32,23 +32,44 @@ const PADDING: [u32; 2] = [0, 0xd503_201f];
 
 /// The symbols that may name each routine, to be confirmed by the report
 /// on each macOS build.
+///
+/// Mach-O prepends a leading underscore to C symbols, so Libplatform's
+/// `_platform_*` symbols appear in the shared cache as `__platform_*`.
 pub const CANDIDATES: [(Id, &[&str]); 5] = [
     (
         Id::Memmove,
         &[
+            "__platform_memmove",
+            "__platform_memcpy",
             "_platform_memmove",
             "_memmove",
             "_memcpy",
             "_platform_memcpy",
         ],
     ),
-    (Id::Bzero, &["_platform_bzero", "_bzero", "___bzero"]),
-    (Id::Memset, &["_platform_memset", "_memset"]),
+    (
+        Id::Bzero,
+        &["__platform_bzero", "_platform_bzero", "_bzero", "___bzero"],
+    ),
+    (
+        Id::Memset,
+        &["__platform_memset", "_platform_memset", "_memset"],
+    ),
     (
         Id::Memcmp,
-        &["_platform_memcmp", "_platform_bcmp", "_memcmp", "_bcmp"],
+        &[
+            "__platform_memcmp",
+            "__platform_bcmp",
+            "_platform_memcmp",
+            "_platform_bcmp",
+            "_memcmp",
+            "_bcmp",
+        ],
     ),
-    (Id::Strlen, &["_platform_strlen", "_strlen"]),
+    (
+        Id::Strlen,
+        &["__platform_strlen", "_platform_strlen", "_strlen"],
+    ),
 ];
 
 #[derive(Args)]
@@ -310,7 +331,15 @@ fn table(rows: &[&Row], build: &str) -> String {
          //! with it on the real bytes (`tests/hle_real.rs`).\n\
          use super::{Id, Signature};\n\npub static SIGNATURES: &[Signature] = &[\n",
     );
+    let mut seen = Vec::new();
     for row in rows {
+        let Some(signature) = row.signature else {
+            continue;
+        };
+        if seen.contains(&signature) {
+            continue;
+        }
+        seen.push(signature);
         let _ = write!(out, "{}", line(row, build));
     }
     out.push_str("];\n");

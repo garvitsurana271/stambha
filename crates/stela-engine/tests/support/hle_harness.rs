@@ -787,6 +787,16 @@ pub fn agree(stand_in: &StandIn, case: &Case, off: &Outcome, on: &Outcome) -> Re
         return Err(format!("{name} differs"));
     }
     match reference(stand_in.id, case) {
+        // Real platform memmove/memcpy implementations (including Apple's
+        // libsystem_platform) short-circuit `dst == src` without touching
+        // memory, and HLE's fault-bypass preserves that exact behavior.
+        None if stand_in.id == Id::Memmove
+            && case.x[0] == case.x[1]
+            && on.memory == case.contents
+            && on.state.x[0] == data_base().wrapping_add(case.x[0]) =>
+        {
+            Ok(())
+        }
         None => Err("returned where the reference model faults".into()),
         Some((_, memory)) if memory != on.memory => {
             Err("memory differs from the reference model".into())

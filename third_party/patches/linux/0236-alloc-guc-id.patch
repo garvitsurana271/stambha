@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: rqffael <169403487+rqffael@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 19:11:54 +0000
+Subject: [PATCH] fix(i915): alloc GuC ID outside spinlock in pin_guc_id
+
+---
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c | 43 ++++++++++++++-----
+ 1 file changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index 788e59cdfac9b80706acb722855b1413fe1f4ff3..7c8dceca0f18e6ebcf5008fdaf4866b1246b7af9 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -577,17 +577,22 @@ static inline bool ctx_id_mapped(struct intel_guc *guc, u32 id)
+ }
+ 
+ static inline void set_ctx_id_mapping(struct intel_guc *guc, u32 id,
+-				      struct intel_context *ce)
++				      struct intel_context *ce, gfp_t gfp)
+ {
++	XA_STATE(xas, &guc->context_lookup, id);
+ 	unsigned long flags;
+ 
+ 	/*
+ 	 * xarray API doesn't have xa_save_irqsave wrapper, so calling the
+-	 * lower level functions directly.
++	 * lower level functions directly. When called from a sleepable path
++	 * (loop == true), allow xas_nomem() to grow the node cache outside
++	 * xa_lock rather than dropping the mapping under GFP_ATOMIC.
+ 	 */
+-	xa_lock_irqsave(&guc->context_lookup, flags);
+-	__xa_store(&guc->context_lookup, id, ce, GFP_ATOMIC);
+-	xa_unlock_irqrestore(&guc->context_lookup, flags);
++	do {
++		xas_lock_irqsave(&xas, flags);
++		xas_store(&xas, ce);
++		xas_unlock_irqrestore(&xas, flags);
++	} while (xas_nomem(&xas, gfp));
+ }
+ 
+ static inline void clr_ctx_id_mapping(struct intel_guc *guc, u32 id)
+@@ -2277,7 +2282,7 @@ static int new_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ 		ret = ida_alloc_range(&guc->submission_state.guc_ids,
+ 				      NUMBER_MULTI_LRC_GUC_ID(guc),
+ 				      guc->submission_state.num_guc_ids - 1,
+-				      GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
++				      GFP_ATOMIC | __GFP_NOWARN);
+ 	if (unlikely(ret < 0))
+ 		return ret;
+ 
+@@ -2356,13 +2361,21 @@ static int steal_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ 	}
+ }
+ 
+-static int assign_guc_id(struct intel_guc *guc, struct intel_context *ce)
++static int assign_guc_id(struct intel_guc *guc, struct intel_context *ce,
++			 int *prealloc_id)
+ {
+ 	int ret;
+ 
+ 	lockdep_assert_held(&guc->submission_state.lock);
+ 	GEM_BUG_ON(intel_context_is_child(ce));
+ 
++	if (!intel_context_is_parent(ce) && *prealloc_id >= 0) {
++		++guc->submission_state.guc_ids_in_use;
++		ce->guc_id.id = *prealloc_id;
++		*prealloc_id = -1;
++		return 0;
++	}
++
+ 	ret = new_guc_id(guc, ce);
+ 	if (unlikely(ret < 0)) {
+ 		if (intel_context_is_parent(ce))
+@@ -2387,18 +2400,25 @@ static int assign_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ #define PIN_GUC_ID_TRIES	4
+ static int pin_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ {
+-	int ret = 0;
++	int ret = 0, prealloc_id = -1;
+ 	unsigned long flags, tries = PIN_GUC_ID_TRIES;
+ 
+ 	GEM_BUG_ON(atomic_read(&ce->guc_id.ref));
+ 
+ try_again:
++	prealloc_id = -1;
++	if (!intel_context_is_parent(ce) && context_guc_id_invalid(ce))
++		prealloc_id = ida_alloc_range(&guc->submission_state.guc_ids,
++					      NUMBER_MULTI_LRC_GUC_ID(guc),
++					      guc->submission_state.num_guc_ids - 1,
++					      GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
++
+ 	spin_lock_irqsave(&guc->submission_state.lock, flags);
+ 
+ 	might_lock(&ce->guc_state.lock);
+ 
+ 	if (context_guc_id_invalid(ce)) {
+-		ret = assign_guc_id(guc, ce);
++		ret = assign_guc_id(guc, ce, &prealloc_id);
+ 		if (ret)
+ 			goto out_unlock;
+ 		ret = 1;	/* Indidcates newly assigned guc_id */
+@@ -2410,6 +2430,9 @@ try_again:
+ out_unlock:
+ 	spin_unlock_irqrestore(&guc->submission_state.lock, flags);
+ 
++	if (prealloc_id >= 0)
++		ida_free(&guc->submission_state.guc_ids, prealloc_id);
++
+ 	/*
+ 	 * -EAGAIN indicates no guc_id are available, let's retire any
+ 	 * outstanding requests to see if that frees up a guc_id. If the first
+@@ -2938,7 +2961,7 @@ static int try_context_registration(struct intel_context *ce, bool loop)
+ 	context_registered = ctx_id_mapped(guc, ctx_id);
+ 
+ 	clr_ctx_id_mapping(guc, ctx_id);
+-	set_ctx_id_mapping(guc, ctx_id, ce);
++	set_ctx_id_mapping(guc, ctx_id, ce, loop ? GFP_KERNEL : GFP_ATOMIC);
+ 
+ 	/*
+ 	 * The context_lookup xarray is used to determine if the hardware

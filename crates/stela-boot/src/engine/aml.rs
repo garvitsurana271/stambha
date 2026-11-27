@@ -2067,7 +2067,11 @@ impl HostAcpi {
     /// without an ASUS notebook's WMI device. The package power limits the
     /// device names are read alongside, and only read. A failure is
     /// reported and the boot goes on.
-    pub(super) fn set_asus_thermal_policy(&'static self, mode: stela_boot_core::options::AsusMode) {
+    pub(super) fn set_asus_thermal_policy(
+        &'static self,
+        mode: stela_boot_core::options::AsusMode,
+        config_writes: bool,
+    ) {
         use stela_boot_core::options::AsusMode;
         use stela_drivers::platform::asus_wmi::ThermalMode;
         let wanted = match mode {
@@ -2084,7 +2088,7 @@ impl HostAcpi {
         self.firmware(
             "ASUS thermal policy",
             "the policy is left as the firmware has it",
-            false,
+            config_writes,
             move |session| Self::asus_thermal_policy_entered(session, wanted),
         );
     }
@@ -2139,7 +2143,8 @@ impl HostAcpi {
             }
         };
         let was = mode();
-        let line = match wmi.set_thermal_policy(&policy, wanted) {
+        let line = match session.with_interpreter_slack(|| wmi.set_thermal_policy(&policy, wanted))
+        {
             Ok(value) => alloc::format!(
                 "ASUS thermal policy: was {was}, set {} ({:#x} = {value} by DEVS, DSTS {:#x}), \
                  the firmware reads {}\n",

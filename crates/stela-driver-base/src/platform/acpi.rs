@@ -298,6 +298,7 @@ unsafe extern "C" {
         setup: RegionSetup,
         context: *mut c_void,
     ) -> Status;
+    fn stela_acpi_set_interpreter_slack(enabled: u8) -> u8;
     #[cfg(test)]
     fn stela_acpi_layout(field: u32) -> u64;
 }
@@ -427,6 +428,24 @@ impl Session {
         // SAFETY: the live session owns ACPICA and the native provider.
         checked(unsafe { stela_acpi_initialize_devices() })?;
         guard.check()
+    }
+    /// Run `call` with ACPICA's interpreter slack mode enabled (as Linux's
+    /// `acpi_early_init` sets globally) so real vendor AML that omits an
+    /// explicit `Return` value (e.g. AMD `\_SB.ALIB`) succeeds, restoring
+    /// strict mode on exit.
+    pub fn with_interpreter_slack<T>(&self, call: impl FnOnce() -> T) -> T {
+        struct Restore(u8);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: restoring the exact prior flag on the owning BSP.
+                unsafe {
+                    stela_acpi_set_interpreter_slack(self.0);
+                }
+            }
+        }
+        // SAFETY: the BSP owns the single ACPICA session for this scope.
+        let _restore = Restore(unsafe { stela_acpi_set_interpreter_slack(1) });
+        call()
     }
     /// True only after this provider's C activation succeeded, while its
     /// original namespace remains valid. No caller can manufacture this witness.

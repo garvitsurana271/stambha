@@ -325,6 +325,14 @@ const char *stela_acpi_status_name(acpi_status status) {
     const struct acpi_exception_info *info = acpi_ut_validate_exception(status);
     return info ? info->name : 0;
 }
+/* Toggle ACPICA's interpreter slack mode for a scoped firmware call (e.g.
+ * AMD \_SB.ALIB returning implicitly without an explicit Return object),
+ * returning the previous setting so the caller always restores it. */
+u8 stela_acpi_set_interpreter_slack(u8 enabled) {
+    u8 previous = acpi_gbl_enable_interpreter_slack;
+    acpi_gbl_enable_interpreter_slack = enabled ? TRUE : FALSE;
+    return previous;
+}
 acpi_status stela_acpi_enable_hardware(void) {
     if (!active) return AE_NOT_EXIST;
     if (hardware_enabled) return AE_ALREADY_EXISTS;

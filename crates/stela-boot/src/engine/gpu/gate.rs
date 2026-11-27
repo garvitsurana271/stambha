@@ -1388,6 +1388,14 @@ pub(in crate::engine) fn open_from(first: usize) -> Vec<(usize, String)> {
     SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
     SERVICE_GPUS.store(Box::into_raw(Box::new(names)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
+    // The display holds a frame until the GPU completes the work submitted
+    // before it, which the GPU's own marker shows between guest calls.
+    stela_soc::dcp::gpu::set_reader(|| {
+        shared()
+            .iter()
+            .filter_map(|service| service.completed_marker())
+            .max()
+    });
     failed
 }
 

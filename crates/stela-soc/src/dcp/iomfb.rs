@@ -160,6 +160,11 @@ const STARTED_SWAPS: usize = 16;
 /// as it stands: the AP normally names each fenced surface within a frame or
 /// two of its GPU work completing.
 const FENCE_TIMEOUT: u64 = 2 * COUNTER_HZ;
+/// How long a swap may wait for the GPU to complete the work submitted
+/// before it ([`Frame::gpu_work`]): three refreshes at 60 Hz. The work is
+/// all the GPU's, the surfaces' among it, so a long job of another client
+/// delays a frame by no more than this.
+const GPU_WORK_TIMEOUT: u64 = COUNTER_HZ / 20;
 /// `D594 swap_complete_ap_gated`'s input starts with the swap ID. Its
 /// statistics pointer is absent. The fixed eight-blob storage remains zero
 /// with count zero; the original dispatcher passes that array unconditionally
@@ -916,6 +921,9 @@ pub struct Methods {
     early_fences: VecDeque<(u32, u32)>,
     /// A swap was shown without its fence, which is reported once.
     fence_timeout_reported: bool,
+    /// The GPU's last submitted and last completed command buffer serials
+    /// ([`super::gpu`]); a test's own.
+    gpu_progress: fn() -> (u64, u64),
     /// The four layer slots after the last submitted swap.
     planes: [Option<Layer>; swap::LAYERS],
     frames: VecDeque<Frame>,
@@ -1064,6 +1072,7 @@ impl Methods {
             started: VecDeque::new(),
             early_fences: VecDeque::new(),
             fence_timeout_reported: false,
+            gpu_progress: || (super::gpu::submitted(), super::gpu::completed()),
             planes: [None; swap::LAYERS],
             frames: VecDeque::new(),
             outgoing: VecDeque::new(),
@@ -1129,15 +1138,28 @@ impl Methods {
     }
 
     /// The next submitted swap waiting for its pixels.
+    /// Read the GPU's progress from `progress` instead of [`super::gpu`].
+    #[cfg(test)]
+    pub(crate) fn set_gpu_progress(&mut self, progress: fn() -> (u64, u64)) {
+        self.gpu_progress = progress;
+    }
+
     pub fn frame_pending(&self) -> bool {
         !self.frames.is_empty()
     }
 
     /// How many swaps, in submission order from the oldest, can be shown at
     /// counter `now`: each has its surfaces' GPU work finished, or has
-    /// waited [`FENCE_TIMEOUT`] for it. Swaps are shown in order, so a ready
-    /// swap waits behind one still drawing.
+    /// waited [`FENCE_TIMEOUT`] for it, and the GPU has completed the work
+    /// submitted before it, or it has waited [`GPU_WORK_TIMEOUT`]. Swaps are
+    /// shown in order, so a ready swap waits behind one still drawing.
+    ///
+    /// The AP names no fence for most surfaces; on an Apple GPU the work
+    /// that draws them is done before the display reads them. A Vega APU in
+    /// a ThinkPad T14 Gen 2 was still drawing when each of 214 swaps in ten
+    /// seconds was shown, and parts of macOS's setup window flickered.
     fn ready_swaps(&mut self, now: u64) -> usize {
+        let (_, completed) = (self.gpu_progress)();
         let mut ready = 0;
         let mut blocked = false;
         let mut timed_out = Vec::new();
@@ -1157,6 +1179,9 @@ impl Methods {
                 }
             }
             blocked |= frame.fenced != 0;
+            let drawing = completed < frame.gpu_work
+                && now.saturating_sub(frame.submitted_at) < GPU_WORK_TIMEOUT;
+            blocked |= drawing;
             ready += usize::from(!blocked);
         }
         for (swap_id, fenced) in timed_out {
@@ -1715,7 +1740,7 @@ impl Methods {
         }
         self.presented = self.presented.saturating_add(1);
         self.pace(now, due, shown.swap_id, waiting);
-        self.pacing.ahead += u32::from(super::gpu::completed() < shown.gpu_work);
+        self.pacing.ahead += u32::from((self.gpu_progress)().1 < shown.gpu_work);
         if self.trace_swap(shown.swap_id) {
             self.record_log(Log::Presented {
                 swap_id: shown.swap_id,
@@ -2763,7 +2788,7 @@ impl Methods {
         self.frames.push_back(Frame {
             swap_id,
             client,
-            gpu_work: super::gpu::submitted(),
+            gpu_work: (self.gpu_progress)().0,
             fenced,
             surface_ids: submission.surface_ids,
             waiting_since: None,

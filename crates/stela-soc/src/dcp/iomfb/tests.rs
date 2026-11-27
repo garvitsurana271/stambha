@@ -1905,6 +1905,54 @@ fn a_cursor_only_swap_presents_only_the_rows_its_rectangles_cover() {
 }
 
 #[test]
+fn a_swap_waits_for_the_gpu_work_submitted_before_it() {
+    use std::cell::Cell;
+    std::thread_local! {
+        static PROGRESS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let frames = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    methods.set_swap_tracing(false);
+    methods.set_gpu_progress(|| PROGRESS.with(Cell::get));
+    let layer = [(0, 4, 2, 0x1000)];
+    let fill = |value: u8| {
+        move |_: u64, bytes: &mut [u8]| {
+            bytes.fill(value);
+            true
+        }
+    };
+    let complete = |methods: &mut Methods| {
+        let callback = methods.take_callback().unwrap();
+        (callback.then)(methods, &[]).unwrap();
+    };
+    let period = methods.refresh_ticks;
+    // Submitted after command buffer 7, with 5 complete: held until 7 is.
+    PROGRESS.with(|p| p.set((7, 5)));
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &layer), 0xc));
+    methods.refresh(period);
+    assert!(methods.frame_pending() && !methods.frame_ready(period));
+    PROGRESS.with(|p| p.set((7, 7)));
+    methods.refresh(2 * period);
+    assert!(methods.frame_ready(2 * period));
+    methods.present(2 * period, fill(0x5a)).unwrap();
+    assert_eq!(frames.borrow().len(), 1);
+    complete(&mut methods);
+    // Work that never completes holds a swap no longer than the timeout.
+    PROGRESS.with(|p| p.set((9, 7)));
+    let id = start_swap(&mut methods);
+    let submitted = 3 * period;
+    methods.refresh(submitted);
+    returned(methods.call(*b"A407", &submission(id, &layer), 0xc));
+    methods.refresh(submitted + period);
+    assert!(!methods.frame_ready(submitted + period));
+    let late = submitted + GPU_WORK_TIMEOUT.next_multiple_of(period) + period;
+    methods.refresh(late);
+    assert!(methods.frame_ready(late));
+}
+
+#[test]
 fn a_swap_waits_for_the_gpu_fences_of_the_surfaces_it_shows() {
     let screen = TestScreen(Rc::default(), Some(MODE));
     let frames = screen.0.clone();

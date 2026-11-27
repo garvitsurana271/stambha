@@ -1477,6 +1477,14 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         }
     }
 
+    /// The newest serial the GPU's completion marker shows, read without a
+    /// turn or a driver call ([`Self::marker_value`]): for the display,
+    /// which holds a frame until the work submitted before it completes,
+    /// while no guest call publishes progress.
+    pub fn completed_marker(&self) -> Option<u64> {
+        self.marker_value()
+    }
+
     /// Publishes what the completion marker shows past what is published,
     /// while work is outstanding.
     fn publish_marker(&self) {

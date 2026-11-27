@@ -387,7 +387,7 @@ impl fmt::Display for Rotation {
 }
 
 impl Features {
-    fn transfer_limit(self, read: bool) -> usize {
+    pub fn transfer_limit(self, read: bool) -> usize {
         if read && let Some(limit) = self.max_read_transfer {
             return limit.get();
         }

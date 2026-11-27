@@ -874,3 +874,449 @@ fn launch(sim: &mut Sim, keys: &[Digest], apart: u64) -> Outcome {
         reads: sim.stick.reads(),
     }
 }
+
+#[test]
+fn file_read_splits_contiguous_extents_to_the_devices_read_transfer_limit() {
+    const LIMIT: usize = 128 << 10;
+    const FILE_BYTES: usize = 1 << 20;
+
+    struct Capped {
+        stick: Stick,
+        sizes: Vec<usize>,
+    }
+
+    impl BlockDevice for Capped {
+        fn identity(&self) -> &Identity {
+            &self.stick.identity
+        }
+        fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+            self.stick.read(lba, buffer)
+        }
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            self.stick.write(lba, data)
+        }
+        fn depth(&self) -> usize {
+            self.stick.depth()
+        }
+        fn room(&self) -> bool {
+            self.stick.room()
+        }
+        fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+            if let Command::Read { bytes, .. } = command {
+                if bytes > LIMIT {
+                    return Err(BlockError::Protocol("read exceeded max_transfer"));
+                }
+                self.sizes.push(bytes);
+            }
+            self.stick.start(command)
+        }
+        fn finish(&mut self, tag: u32) -> Option<Finished> {
+            self.stick.finish(tag)
+        }
+    }
+
+    let image: Vec<u8> = (0..FILE_BYTES)
+        .map(|i| ((i * 31 + 7) & 0xff) as u8)
+        .collect();
+    let mut stick = Stick::new(image.clone(), 1);
+    stick.identity.features.max_transfer = LIMIT;
+    let mut device = Capped {
+        stick,
+        sizes: Vec::new(),
+    };
+    let extents = [Extent {
+        offset: 0,
+        bytes: FILE_BYTES as u64,
+    }];
+    let offset = 123u64;
+    let length = (512 << 10) + 777;
+    let mut read = FileRead::start(&mut device, &extents, offset, length)
+        .expect("a contiguous extent past max_transfer splits into valid commands");
+    device.stick.now = u64::MAX / 2;
+    assert!(read.poll(&mut device));
+    let bytes = read.bytes().expect("every split command succeeded");
+    assert_eq!(
+        bytes,
+        &image[offset as usize..offset as usize + length as usize]
+    );
+    assert!(device.sizes.len() >= 5, "sizes: {:?}", device.sizes);
+    assert!(device.sizes.iter().all(|&size| size <= LIMIT));
+}
+
+#[test]
+fn file_read_paces_split_chunks_within_the_devices_queue_room() {
+    const LIMIT: usize = 128 << 10;
+    const FILE_BYTES: usize = 1 << 20;
+    const QUEUE_CAP: usize = 2;
+
+    struct TightQueue {
+        stick: Stick,
+        in_flight: usize,
+        peak_in_flight: usize,
+        commits: usize,
+    }
+
+    impl BlockDevice for TightQueue {
+        fn identity(&self) -> &Identity {
+            &self.stick.identity
+        }
+        fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+            self.stick.read(lba, buffer)
+        }
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            self.stick.write(lba, data)
+        }
+        fn depth(&self) -> usize {
+            QUEUE_CAP
+        }
+        fn room(&self) -> bool {
+            self.in_flight < QUEUE_CAP
+        }
+        fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+            if self.in_flight >= QUEUE_CAP {
+                return Err(BlockError::Protocol("the staged disk queue is full"));
+            }
+            if let Command::Read { bytes, .. } = command
+                && bytes > LIMIT
+            {
+                return Err(BlockError::Protocol("read exceeded max_transfer"));
+            }
+            let tag = self.stick.start(command)?;
+            self.in_flight += 1;
+            self.peak_in_flight = self.peak_in_flight.max(self.in_flight);
+            Ok(tag)
+        }
+        fn commit(&mut self) {
+            self.commits += 1;
+        }
+        fn finish(&mut self, tag: u32) -> Option<Finished> {
+            let result = self.stick.finish(tag)?;
+            self.in_flight -= 1;
+            Some(result)
+        }
+    }
+
+    let image: Vec<u8> = (0..FILE_BYTES)
+        .map(|i| ((i * 17 + 3) & 0xff) as u8)
+        .collect();
+    let mut stick = Stick::new(image.clone(), 1);
+    stick.identity.features.max_transfer = LIMIT;
+    let mut device = TightQueue {
+        stick,
+        in_flight: 0,
+        peak_in_flight: 0,
+        commits: 0,
+    };
+    let extents = [Extent {
+        offset: 0,
+        bytes: FILE_BYTES as u64,
+    }];
+    let offset = 4096 + 77;
+    let length = (640 << 10) + 333;
+    let mut read = FileRead::start(&mut device, &extents, offset, length)
+        .expect("a tight queue accepts the first chunks without failing");
+    assert_eq!(device.in_flight, QUEUE_CAP);
+    let mut polls = 0;
+    loop {
+        device.stick.now = device.stick.busy_until;
+        polls += 1;
+        if read.poll(&mut device) {
+            break;
+        }
+        assert!(polls < 32, "read did not complete");
+    }
+    assert_eq!(device.in_flight, 0);
+    assert_eq!(device.peak_in_flight, QUEUE_CAP);
+    assert!(device.commits >= 2, "later chunks must ring commit()");
+    let bytes = read.bytes().expect("every paced chunk succeeded");
+    assert_eq!(
+        bytes,
+        &image[offset as usize..offset as usize + length as usize]
+    );
+}
+
+#[test]
+fn staged_writes_split_to_max_transfer_pace_on_room_and_reset_on_error() {
+    use stela_formats::journal::Target;
+
+    const LIMIT: usize = 1024;
+    const QUEUE_CAP: usize = 2;
+    const FILE_BYTES: usize = 8192;
+
+    struct TightWriteQueue {
+        identity: Identity,
+        image: Vec<u8>,
+        pending: BTreeMap<u32, (u64, Vec<u8>, bool)>,
+        next_tag: u32,
+        peak_in_flight: usize,
+        commits: usize,
+        writes_started: usize,
+        fail_finish_on: Option<usize>,
+        fail_start_on: Option<usize>,
+        /// Keep this tag in flight (`finish` returns `None`) for `remaining`
+        /// finish polls before completing it.
+        hold_finish: Option<(u32, usize)>,
+    }
+
+    impl TightWriteQueue {
+        fn new() -> Self {
+            Self {
+                identity: Identity {
+                    transport: Transport::Nvme,
+                    location: String::from("fake-nvme"),
+                    model: String::from("tight-write"),
+                    serial: String::new(),
+                    blocks: (FILE_BYTES / BLOCK as usize) as u64,
+                    block_size: BLOCK,
+                    read_only: false,
+                    features: Features {
+                        max_transfer: LIMIT,
+                        ..Features::default()
+                    },
+                },
+                image: vec![0u8; FILE_BYTES],
+                pending: BTreeMap::new(),
+                next_tag: 1,
+                peak_in_flight: 0,
+                commits: 0,
+                writes_started: 0,
+                fail_finish_on: None,
+                fail_start_on: None,
+                hold_finish: None,
+            }
+        }
+    }
+
+    impl BlockDevice for TightWriteQueue {
+        fn identity(&self) -> &Identity {
+            &self.identity
+        }
+        fn read(&mut self, _lba: u64, _buffer: &mut [u8]) -> Result<(), BlockError> {
+            Err(BlockError::Unsupported("write-only test device"))
+        }
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            let start = (lba * u64::from(BLOCK)) as usize;
+            self.image[start..start + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn depth(&self) -> usize {
+            QUEUE_CAP
+        }
+        fn room(&self) -> bool {
+            self.pending.len() < QUEUE_CAP
+        }
+        fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+            if self.pending.len() >= QUEUE_CAP {
+                return Err(BlockError::Protocol("the staged disk queue is full"));
+            }
+            let Command::Write { lba, data, .. } = command else {
+                return Err(BlockError::Unsupported("unexpected command"));
+            };
+            assert!(
+                data.len() <= LIMIT,
+                "staged write chunk {} exceeded max_transfer {LIMIT}",
+                data.len()
+            );
+            self.writes_started += 1;
+            if self.fail_start_on == Some(self.writes_started) {
+                return Err(BlockError::Protocol("injected start failure"));
+            }
+            let fail_finish = self.fail_finish_on == Some(self.writes_started);
+            let tag = self.next_tag;
+            self.next_tag += 1;
+            self.pending.insert(tag, (lba, data, fail_finish));
+            self.peak_in_flight = self.peak_in_flight.max(self.pending.len());
+            Ok(tag)
+        }
+        fn commit(&mut self) {
+            self.commits += 1;
+        }
+        fn finish(&mut self, tag: u32) -> Option<Finished> {
+            if let Some((held, remaining)) = self.hold_finish.as_mut()
+                && *held == tag
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                return None;
+            }
+            let (lba, data, fail) = self.pending.remove(&tag)?;
+            if fail {
+                return Some(Err(BlockError::Protocol("injected completion failure")));
+            }
+            let start = (lba * u64::from(BLOCK)) as usize;
+            self.image[start..start + data.len()].copy_from_slice(&data);
+            Some(Ok(None))
+        }
+    }
+
+    let extents = [
+        Extent {
+            offset: 0,
+            bytes: 3072,
+        },
+        Extent {
+            offset: 4096,
+            bytes: 4096,
+        },
+    ];
+    let payload: Vec<u8> = (0..5120).map(|i| ((i * 29 + 7) & 0xff) as u8).collect();
+    let offset = 1024;
+
+    // 1. Paced write splits into <= max_transfer chunks and honors room().
+    let mut device = TightWriteQueue::new();
+    let mut queued = Queued::default();
+    let mut polls = 0;
+    loop {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        polls += 1;
+        if staged
+            .write_at(offset, &payload)
+            .expect("paced write succeeds")
+        {
+            break;
+        }
+        assert!(polls < 16, "staged write did not finish");
+    }
+    assert_eq!(device.peak_in_flight, QUEUE_CAP);
+    assert!(device.commits >= 3);
+    assert_eq!(&device.image[1024..3072], &payload[..2048]);
+    assert_eq!(&device.image[4096..4096 + 3072], &payload[2048..]);
+
+    // 2. A completion error on one in-flight tag resets `queued` so retrying at
+    // the exact same offset re-submits and writes every byte instead of
+    // skipping setup and reporting false success.
+    let mut device = TightWriteQueue::new();
+    device.fail_finish_on = Some(1);
+    let mut queued = Queued::default();
+    {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        assert_eq!(staged.write_at(offset, &payload), Ok(false));
+        assert!(staged.write_at(offset, &payload).is_err());
+    }
+    assert!(device.pending.is_empty(), "abort drained remaining tag");
+    device.image.fill(0);
+    device.fail_finish_on = None;
+    let started_before_retry = device.writes_started;
+    let mut polls = 0;
+    loop {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        polls += 1;
+        if staged
+            .write_at(offset, &payload)
+            .expect("retry at same offset succeeds")
+        {
+            break;
+        }
+        assert!(polls < 16, "retry write did not finish");
+    }
+    assert!(
+        device.writes_started > started_before_retry,
+        "retry at the same offset must re-submit commands"
+    );
+    assert_eq!(&device.image[1024..3072], &payload[..2048]);
+    assert_eq!(&device.image[4096..4096 + 3072], &payload[2048..]);
+
+    // 3. A start_more error after partial submission also commits started tags,
+    // drains/abandons them, and resets `queued` for a clean retry at the same
+    // offset.
+    let mut device = TightWriteQueue::new();
+    device.fail_start_on = Some(2);
+    let mut queued = Queued::default();
+    {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        assert!(staged.write_at(offset, &payload).is_err());
+    }
+    assert_eq!(device.commits, 1);
+    assert!(device.pending.is_empty());
+    device.image.fill(0);
+    device.fail_start_on = None;
+    loop {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        if staged
+            .write_at(offset, &payload)
+            .expect("retry after start error succeeds")
+        {
+            break;
+        }
+    }
+    assert_eq!(&device.image[1024..3072], &payload[..2048]);
+    assert_eq!(&device.image[4096..4096 + 3072], &payload[2048..]);
+
+    // 4. Commands still in flight when an error aborts the write are retained
+    // in `abandoned` and collected on subsequent turns so no queue slot is
+    // permanently leaked and retries wait until in-flight tags finish.
+    let mut device = TightWriteQueue::new();
+    device.fail_finish_on = Some(1);
+    device.hold_finish = Some((2, 2)); // tag 2 stays in flight across abort + 1 poll
+    let mut queued = Queued::default();
+    {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        assert_eq!(staged.write_at(offset, &payload), Ok(false));
+        assert!(staged.write_at(offset, &payload).is_err());
+    }
+    assert_eq!(
+        device.pending.len(),
+        1,
+        "tag 2 must still be in flight after abort"
+    );
+    device.fail_finish_on = None;
+    let started_before_drain = device.writes_started;
+    {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        // First retry poll: tag 2 is still not ready -> no new writes started yet.
+        assert_eq!(staged.write_at(offset, &payload), Ok(false));
+        assert_eq!(device.writes_started, started_before_drain);
+        assert_eq!(device.pending.len(), 1);
+    }
+    device.image.fill(0);
+    let mut polls = 0;
+    loop {
+        let mut staged = Staged {
+            device: &mut device,
+            extents: &extents,
+            queued: &mut queued,
+        };
+        polls += 1;
+        if staged
+            .write_at(offset, &payload)
+            .expect("retry succeeds after abandoned tag is collected")
+        {
+            break;
+        }
+        assert!(polls < 16, "retry after abandoned drain did not finish");
+    }
+    assert!(
+        device.pending.is_empty(),
+        "every abandoned tag slot must be reclaimed"
+    );
+    assert_eq!(&device.image[1024..3072], &payload[..2048]);
+    assert_eq!(&device.image[4096..4096 + 3072], &payload[2048..]);
+}

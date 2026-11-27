@@ -176,6 +176,32 @@ pub fn assumed_size_mm(width: u32, height: u32) -> (u32, u32) {
     (mm(w), mm(h))
 }
 
+/// The widest mode SkyLight's density rule may still double: a panel
+/// narrower than this at 2x would leave macOS fewer than 1280 points across.
+const DOUBLED_WIDTH: u32 = 2560;
+/// The most pixels per inch an image narrower than [`DOUBLED_WIDTH`] is
+/// published at: below 2 x 110 / 1.5 (146.7), the density SkyLight's rule
+/// keeps at its native scale.
+const SINGLE_SCALE_PPI: u32 = 140;
+
+/// `size_mm` for `mode` as macOS is told it: a small, dense panel's image
+/// grown to [`SINGLE_SCALE_PPI`], so that macOS keeps it at its native scale
+/// instead of doubling it. A ThinkPad T14 Gen 2's 1920 x 1080 panel, 309 x
+/// 174 mm (157 ppi), was doubled to a desktop like 960 x 540, too small for
+/// macOS's setup window. A monitor up to that density keeps its size.
+pub fn published_size_mm(mode: Mode, size_mm: (u32, u32)) -> (u32, u32) {
+    let (width_mm, height_mm) = size_mm;
+    if mode.width >= DOUBLED_WIDTH || width_mm == 0 || height_mm == 0 {
+        return size_mm;
+    }
+    let least_mm = (u64::from(mode.width) * 254).div_ceil(u64::from(SINGLE_SCALE_PPI) * 10);
+    if u64::from(width_mm) >= least_mm {
+        return size_mm;
+    }
+    let grown_height = (u64::from(height_mm) * least_mm).div_ceil(u64::from(width_mm));
+    (least_mm as u32, grown_height as u32)
+}
+
 /// Whether `mode` at `refresh` millihertz has a pixel clock past a detailed
 /// timing's, so its record is built directly ([`fast_timing`]).
 fn fast(mode: Mode, refresh: u32) -> bool {
@@ -768,6 +794,7 @@ impl Advertised {
         size_mm: Option<(u32, u32)>,
         monitor: Option<MonitorId>,
     ) -> Result<Self> {
+        let size_mm = size_mm.map(|size| published_size_mm(mode, size));
         let from_monitor = monitor.is_some();
         if !fast(mode, refresh)
             && let Ok(edid) = edid_of(mode, refresh, size_mm, monitor)
@@ -1479,6 +1506,19 @@ mod tests {
             // another display adapter.
             (uhd, Some((699, 395)), 2),
             (FULL_HD, Some((699, 395)), 1),
+            // A 14" laptop's 1920 x 1080 panel (309 x 174 mm, 157 ppi),
+            // published at 140 ppi, stays at its native scale.
+            (FULL_HD, Some((309, 174)), 1),
+            // A 13.3" 2560 x 1600 panel keeps its size and is doubled.
+            (
+                Mode {
+                    width: 2560,
+                    height: 1600,
+                    format: PixelFormat::Bgra8888,
+                },
+                Some((286, 179)),
+                2,
+            ),
         ] {
             let a = Advertised::sized(mode, 60_000, size).unwrap();
             let attributes = a.display_attributes();

@@ -1326,3 +1326,41 @@ fn firmware_containment_leaves_smi_pins_alone_and_clears_every_other_mode() {
         assert_eq!(plan.verify_contained(), Err(IrqError::Route));
     }
 }
+
+/// Claiming a pin through `Unit` (such as ACPI SCI on GSI 9 under
+/// `--acpi-hardware`) must not cause `verify_contained` to fail or poison
+/// subsequent PCI containment checks, while unclaimed pins remain verified.
+#[test]
+fn verify_contained_allows_claimed_lines_and_catches_unclaimed_changes() {
+    let (board, unit, registry, line) = fixture();
+    // SAFETY: sole controller, CPU and original firmware route model.
+    let plan = unsafe { unit.firmware_routes() }.unwrap();
+    // SAFETY: the fixture retains the exact original controller.
+    unsafe { plan.contain() }.unwrap();
+    plan.verify_contained().unwrap();
+
+    // Claim and arm GSI 9 just as ACPI SCI does before PCI device bring-up.
+    // SAFETY: the fixture owns GSI 9 and its sole contributor.
+    let pin = unsafe { unit.claim(line, Box::new(Contributors(board.clone()))) }.unwrap();
+    let registration = registry
+        .request(stela_drivers::bus::irq::Request {
+            source: Box::new(pin),
+            handler: Arc::new(Member(board.clone(), 1, true)),
+            routing: stela_drivers::bus::irq::RouteRequest::Line(line),
+        })
+        .unwrap();
+
+    // Claimed pin is owned by Unit; every other pin is still masked.
+    plan.verify_contained().unwrap();
+    // A second claim on GSI 9 must still be refused.
+    assert_eq!(plan.verify_line(line.gsi), Err(IrqError::Route));
+    // Unclaimed pins still verify cleanly.
+    plan.verify_line(1).unwrap();
+
+    // Tampering with an unclaimed pin must still be caught.
+    board.hw.lock().unwrap().regs[0x10 + 3 * 2] = 0x35;
+    assert_eq!(plan.verify_contained(), Err(IrqError::Route));
+    // Once containment fails, subsequent checks stay Unavailable.
+    assert_eq!(plan.verify_contained(), Err(IrqError::Unavailable));
+    drop(registration);
+}

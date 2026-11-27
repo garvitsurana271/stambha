@@ -208,14 +208,16 @@ impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
             // SAFETY: the unit lock held above serializes the withheld table.
             unsafe { (*unit.withheld.get())[usize::from(pin)] = withheld };
         }
-        self.check_masked()?;
+        self.check_masked(false)?;
         self.phase.set(FirmwarePhase::Contained);
         Ok(())
     }
 
-    /// Check that every contained pin still reads as the cleared masked
-    /// entry, every withheld pin stays masked and every SMI pin keeps the
-    /// firmware's entry.
+    /// Check that every unclaimed contained pin still reads as the cleared
+    /// masked entry, every withheld pin stays masked and every SMI pin keeps
+    /// the firmware's entry. Pins claimed by this controller (such as an
+    /// active ACPI SCI line under `--acpi-hardware`) are already owned by
+    /// [`Unit`].
     pub fn verify_contained(&self) -> Result<(), IrqError> {
         if self.phase.get() != FirmwarePhase::Contained {
             return Err(IrqError::Unavailable);
@@ -225,7 +227,7 @@ impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
         unit.domain.check().map_err(IrqError::Delivery)?;
         let _guard = unit.lock();
         self.phase.set(FirmwarePhase::Uncertain);
-        self.check_masked()?;
+        self.check_masked(true)?;
         self.phase.set(FirmwarePhase::Contained);
         Ok(())
     }
@@ -264,9 +266,13 @@ impl<R: Registers, P: Platform> FirmwareRoutes<R, P> {
         })
     }
 
-    fn check_masked(&self) -> Result<(), IrqError> {
+    fn check_masked(&self, allow_claimed: bool) -> Result<(), IrqError> {
         let unit = &self.unit;
         for (pin, &(low, _)) in (0..unit.pins as u8).zip(&self.entries) {
+            // SAFETY: the caller holds the selector and claims lock.
+            if allow_claimed && unsafe { (*unit.claims.get())[usize::from(pin)] } {
+                continue;
+            }
             let (now, high) = unit.firmware_entry(pin)?;
             let kept = match unit.withheld(pin) {
                 Some(_) if low & DELIVERY_MODE == SMI => now & CONFIG == low & CONFIG,

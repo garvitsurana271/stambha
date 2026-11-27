@@ -667,11 +667,7 @@ impl KernelWork {
         let _watched = Watched::enter();
         self.reservation
             .identity
-            .check_clock_root()
-            .map_err(Error::Work)?;
-        self.reservation
-            .identity
-            .check_dispatch()
+            .check_irq_cpu()
             .map_err(Error::Work)?;
         let runtime = self.executor.runtime();
         // A continuation of this processor's own holds the lock below. The
@@ -681,20 +677,23 @@ impl KernelWork {
         if super::storage::host_drivers_held_here() {
             return Err(Error::Work(WorkError::WouldDeadlock));
         }
-        // SAFETY: loader root on this physical BSP, no native
-        // or IRQ frame; every continuation was checked in this same domain.
+        // SAFETY: loader root on this physical BSP, no native or IRQ frame
+        // (verified immediately below, just as `Self::dispatch` does so calls
+        // from the guest run loop's tagged guest roots are admitted).
         let _root = unsafe { RestoreRoot::enter(self.root) };
+        self.reservation
+            .identity
+            .check_clock_root()
+            .map_err(Error::Work)?;
+        self.reservation
+            .identity
+            .check_dispatch()
+            .map_err(Error::Work)?;
         match runtime.current_id() {
             Ok(_) => return Err(Error::Work(WorkError::WouldDeadlock)),
             Err(WorkError::Unavailable) => {}
             Err(error) => return Err(Error::Work(error)),
         }
-        // This checks the original allocation/entered root link only;
-        // it supplies no rate, timer, firmware-service or task admission grant.
-        self.reservation
-            .identity
-            .check_clock_root()
-            .map_err(Error::Work)?;
         let deadline = self.deadline_us(timeout_us)?;
         if self.busy.replace(true) {
             return Err(Error::Work(WorkError::Busy));

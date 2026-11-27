@@ -1790,17 +1790,49 @@ impl HostAcpi {
         *self.buttons.borrow_mut() = found.buttons;
     }
 
+    /// Whether any deferred ACPI, SCI, EC, power, lid, brightness or ASUS WMI
+    /// work is currently pending. Checked lock-free on the BSP guest loop so
+    /// idle boundaries never acquire [`super::storage::RestoreRoot`].
+    fn needs_poll(&self, provider: &Provider) -> bool {
+        if provider.queued.load(Ordering::Acquire)
+            || POWER_CHANGED.load(Ordering::Acquire)
+            || POWER_POLL.load(Ordering::Acquire)
+            || EC_EVENT.load(Ordering::Acquire)
+            || self.ec_pending.get()
+            || LID_NOTIFIED.load(Ordering::Acquire) != 0
+            || BRIGHTNESS_SEEN.load(Ordering::Acquire) != 0
+            || BRIGHTNESS.iter().any(|b| b.load(Ordering::Acquire) != 0)
+            || ASUS_EVENTS.load(Ordering::Acquire) != 0
+        {
+            return true;
+        }
+        if !self.hardware_active() {
+            return false;
+        }
+        provider.needs_rearm.get()
+            || provider
+                .sci_governor
+                .get()
+                .is_some_and(|governor| governor.polled())
+            || provider
+                .sci
+                .try_borrow()
+                .ok()
+                .is_some_and(|sci| sci.as_ref().is_some_and(|armed| armed.interrupted()))
+    }
+
     pub(super) fn poll(&'static self) {
         // SAFETY: this permanent provider is held by the leaked Session.
         let provider = unsafe { &*self.provider };
-        // These atomic observations do not borrow AML/provider mutable state
-        // while an uncertain continuation might remain held in quarantine.
-        if self.deferred_failed.load(Ordering::Acquire)
-            || (!self.hardware_active()
-                && !provider.queued.load(Ordering::Acquire)
-                && !POWER_CHANGED.load(Ordering::Acquire)
-                && !EC_EVENT.load(Ordering::Acquire))
-        {
+        // These observations do not borrow AML/provider mutable state while an
+        // uncertain continuation might remain held in quarantine.
+        if self.deferred_failed.load(Ordering::Acquire) || !self.needs_poll(provider) {
+            return;
+        }
+        // Do not spin waiting for `Domain::Shared` if another core currently
+        // holds it (e.g. `host_core` pumping the GPU): try again on the next
+        // guest boundary.
+        if super::storage::host_drivers_taken() {
             return;
         }
         if let Err(error) = provider

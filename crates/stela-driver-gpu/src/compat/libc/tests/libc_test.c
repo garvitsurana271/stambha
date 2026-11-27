@@ -571,6 +571,7 @@ static void test_time(void)
 		(long)((UINT64_MAX - 1) % 1000000000)};
 	CHECK(clock_nanosleep(CLOCK_MONOTONIC, 0, &too_late, NULL) == EOVERFLOW);
 	CHECK(!getenv("HOME"));
+	CHECK(getenv("ANV_SYS_MEM_LIMIT") && !strcmp(getenv("ANV_SYS_MEM_LIMIT"), "100"));
 }
 
 static _Thread_local int per_thread = 5;

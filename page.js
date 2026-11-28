@@ -40,7 +40,8 @@
     const add = (kind, text) => notes.push([kind, text]);
     if (GPU[gpu]) add('ok', `${GPU[gpu]}: supported, with GPU acceleration.`);
     else if (gpu === 'oldnv') add('no', 'NVIDIA cards older than the GTX 16 series aren’t supported.');
-    else if (gpu === 'amd' || gpu === 'intel') add('no', 'AMD and Intel graphics aren’t supported yet. They’re on the roadmap.');
+    else if (gpu === 'amd') add('warn', 'AMD Radeon: experimental. RX 6000/7000 boot macOS in the AMD & Intel build; RX 9000 is in testing. Vega and newer only.');
+    else if (gpu === 'intel') add('warn', 'Intel graphics: experimental. Iris Xe, UHD and Arc reach the macOS desktop in test builds.');
     else add('ask', 'Check Task Manager → Performance → GPU to see your card.');
     if (type === 'laptop') {
       if (mux === 'yes') add('ok', 'Switch it to NVIDIA-only mode before you start Stambha.');
@@ -94,9 +95,9 @@
   // ---------- FAQ ----------
   const FAQ = [
     ['Is this a Hackintosh?', 'No. A Hackintosh runs the Intel version of macOS with patches and kexts. Stambha runs the Apple-silicon version, unmodified, by translating its Arm code to your PC’s x86 processor as it runs.'],
-    ['How fast is it?', 'Stambha 0.6.0 is about 1.5x faster than Stela 0.5.0, and speed is the focus of the next release. It is still slower than a real Mac, since it translates macOS’s Arm code as it runs.'],
+    ['How fast is it?', 'Stambha 0.6.0 is about 1.5x faster than Stela 0.5.0 — a comparison with the previous version, not with a Mac. It is still slower than a real Mac, since it translates macOS’s Arm code as it runs, and speed is the focus of the next release.'],
     ['Will it touch Windows?', 'The installer only uses empty (unallocated) space: it never resizes, moves or deletes a partition, checks every write, and has a Check only dry run that writes nothing. You make the empty space yourself in Windows Disk Management.'],
-    ['AMD or Intel graphics?', 'Not yet: NVIDIA GTX 16 and RTX 20 to 50 only for now. AMD and Intel graphics are on the roadmap.'],
+    ['AMD or Intel graphics?', 'Experimental, in the separate AMD & Intel build: AMD Radeon RX 6000/7000 boot macOS (RX 9000 in testing; Vega and newer only), and Intel Iris Xe, UHD and Arc reach the desktop in test builds. NVIDIA remains the supported path.'],
     ['Does it work on laptops?', 'Yes. Laptops with an NVIDIA-only (MUX) mode work best. The touchpad works and Wi-Fi works on the Realtek RTL8852CE; battery, brightness keys, lid and Bluetooth are coming next.'],
     ['Which Wi-Fi works?', 'Realtek RTL8852CE works today, for installing over Wi-Fi with no cable. Intel and other Wi-Fi chips aren’t supported yet: use Ethernet or a USB Ethernet adapter.'],
     ['How long does an install take?', 'About an hour over a decent connection. Keep the charger in and the network up.'],
